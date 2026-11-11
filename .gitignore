@@ -10,3 +10,7 @@ build/
 dist/
 .benchmarks/
 data/
+venv/
+node_modules/
+*.pyc
+.env
