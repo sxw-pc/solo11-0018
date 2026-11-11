@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}公告{% endblock %}
+{% block content %}
+<main id="notice-area">
+  <h1>平台公告</h1>
+  <section id="main-notice">
+    <h2>核心公告</h2>
+    <p>{{ notice }}</p>
+  </section>
+  <p>维护窗口：{{ window }}</p>
+  <p>服务范围：文档站、公告页、价格表与状态页。</p>
+  <p>变更记录：每次调整都会保留版本，便于审计。</p>
+  <p>{{ contact }}</p>
+  <aside class="analytics">
+    <p>本页访问计数：9999（此区域会被 exclude_selectors 裁剪）</p>
+  </aside>
+</main>
+{% endblock %}

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}状态{% endblock %}
+{% block content %}
+<main>
+  <h1>运行状态</h1>
+  <p>本页面包含计数器、时间戳与会话串等动态噪声。</p>
+  <p>核心服务：正常。</p>
+  <p class="counter">当前访问计数：{{ counter }}</p>
+  <p class="timestamp">更新时间：{{ timestamp }}</p>
+  <p class="noise">随机会话：{{ session }}</p>
+  <p>说明：动态值应通过 noise_patterns 掩码，避免误报。</p>
+</main>
+{% endblock %}

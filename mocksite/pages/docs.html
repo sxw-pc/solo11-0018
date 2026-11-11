@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}文档{% endblock %}
+{% block content %}
+<main id="doc-body">
+  <h1>本地部署手册</h1>
+  {% for paragraph in paragraphs %}
+  <p>{{ paragraph }}</p>
+  {% endfor %}
+</main>
+{% endblock %}

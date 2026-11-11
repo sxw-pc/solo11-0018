@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}价格{% endblock %}
+{% block content %}
+<main>
+  <h1>示例价格表</h1>
+  <p class="muted">以下均为占位价格，不对应任何真实产品或公司。</p>
+  <table id="price-table">
+    <thead>
+      <tr><th>版本</th><th>月费（示例币）</th><th>额度</th></tr>
+    </thead>
+    <tbody>
+      {% for name, price, quota in rows %}
+      <tr><td>{{ name }}</td><td>{{ price }}</td><td>{{ quota }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="ad">示例广告：此段落可以使用 exclude_selectors 移除。</p>
+</main>
+{% endblock %}

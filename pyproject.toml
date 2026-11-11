@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pagewatch"
+version = "0.1.0"
+description = "Local, auditable web page change monitoring and digest tool"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "requests>=2.31",
+  "beautifulsoup4>=4.12",
+  "PyYAML>=6.0",
+  "Flask>=3.0",
+  "lxml>=4.9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-cov>=5"]
+
+[project.scripts]
+pagewatch = "pagewatch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["pagewatch*", "mocksite*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+mocksite = ["pages/*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src", "."]
+
+[tool.coverage.run]
+source = ["pagewatch"]
+branch = false
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

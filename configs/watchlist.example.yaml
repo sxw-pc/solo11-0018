@@ -1,0 +1,48 @@
+version: 1
+# All example targets are the bundled local mock site. pagewatch's built-in
+# allowlist rejects every host except 127.0.0.1, localhost and ::1.
+watches:
+  - name: announcements
+    url: http://127.0.0.1:8765/announcements
+    interval_seconds: 300
+    tags: [notice, priority]
+    include_selectors: ["#notice-area"]
+    exclude_selectors: [".analytics"]
+    noise_patterns: []
+    keywords: ["重要", "计费"]
+    enabled: true
+    rule_overrides:
+      alert_cooldown_seconds: 600
+
+  - name: docs
+    url: http://127.0.0.1:8765/docs
+    interval_seconds: 900
+    tags: [docs]
+    include_selectors: ["#doc-body"]
+    exclude_selectors: []
+    noise_patterns: []
+    keywords: []
+    enabled: true
+
+  - name: pricing
+    url: http://127.0.0.1:8765/pricing
+    interval_seconds: 600
+    tags: [pricing]
+    include_selectors: ["#price-table"]
+    exclude_selectors: [".ad"]
+    noise_patterns: []
+    keywords: ["价格", "月费"]
+    enabled: true
+
+  - name: noisy-status
+    url: http://127.0.0.1:8765/noisy
+    interval_seconds: 120
+    tags: [status, noisy]
+    include_selectors: ["main"]
+    exclude_selectors: []
+    noise_patterns:
+      - '当前访问计数[：:]\s*\d+'
+      - '更新时间[：:]\s*[0-9:\- ]+'
+      - '随机会话[：:]\s*[A-Za-z0-9_-]+'
+    keywords: []
+    enabled: true

@@ -1,0 +1,34 @@
+version: 1
+
+classification:
+  # A change is noise when its changed-line ratio is below this floor.
+  noise_max_change_rate: 0.02
+  # A change is major when its ratio reaches this threshold.
+  major_change_rate: 0.35
+  # A change touching any of these CSS regions is always major.
+  focus_selectors: ["#main-notice", ".critical"]
+
+alerts:
+  # Alerts are local-only (SQLite + JSONL). Only major is emitted by default.
+  severities: ["major"]
+  cooldown_seconds: 3600
+
+diff:
+  # Unified diff text stored with each event is capped at this many characters.
+  max_chars: 12000
+
+retention:
+  # Keep the newest N snapshots per watch, regardless of severity.
+  keep_last: 5
+  # Snapshots that produced a major event are never pruned.
+  major_keep_forever: true
+  # Unreferenced gzip archives may be deleted after this many days.
+  archive_max_age_days: 30
+
+schedule:
+  max_workers: 4
+  jitter_seconds: 10
+
+fetch:
+  timeout_seconds: 5
+  max_bytes: 2097152

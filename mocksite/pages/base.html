@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地示例站 · {% block title %}pagewatch{% endblock %}</title>
+  <style>
+    body { font-family: sans-serif; margin: 0; background: #fafafa; color: #222; }
+    nav { padding: 12px 24px; background: #18324a; }
+    nav a { color: #fff; margin-right: 16px; text-decoration: none; }
+    main { max-width: 900px; margin: 24px auto; padding: 20px; background: #fff; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    .muted { color: #666; font-size: 14px; }
+  </style>
+</head>
+<body>
+<nav>
+  <a href="/announcements">公告</a>
+  <a href="/docs">文档</a>
+  <a href="/pricing">价格</a>
+  <a href="/noisy">状态</a>
+</nav>
+{% block content %}{% endblock %}
+<footer class="muted" style="padding: 20px 24px;">本地模拟站点，仅用于 pagewatch 离线演示。</footer>
+</body>
+</html>
