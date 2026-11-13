@@ -1,20 +1,89 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
 import yaml
 
 import pagewatch.cli as cli
-from pagewatch.models import Rules, WatchSpec
+from pagewatch.fetch.client import FetchResult
+from pagewatch.models import DataPaths, Rules, WatchSpec
 from pagewatch.report.status import create_status_app, serve_status
 from pagewatch.runner import Runner
 from pagewatch.storage.db import connect, init_paths
 from pagewatch.storage.events import list_audit, list_events
-from pagewatch.storage.snapshots import list_schedules
+from pagewatch.storage.snapshots import list_schedules, list_snapshots
 
 ROOT = Path(__file__).parents[1]
+
+
+class _CountingClient:
+    """Returns a distinct body per fetch, after a small overlap window."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._count = 0
+
+    def fetch(self, url: str, *, etag=None, last_modified=None) -> FetchResult:
+        with self._lock:
+            self._count += 1
+            number = self._count
+        time.sleep(0.05)
+        text = (f"<html><body><main><h1>Title</h1>"
+                f"<p>version {number}</p></main></body></html>")
+        return FetchResult(status_code=200, url=url, body=text.encode("utf-8"),
+                           text=text, etag=f'"{number}"', last_modified=None,
+                           elapsed_ms=1, not_modified=False)
+
+
+def test_concurrent_workers_keep_the_snapshot_chain_linear(tmp_path):
+    """Two workers on one watch must not fork the version chain.
+
+    Regression: the head was read before the write transaction, so both
+    workers could insert a version and the second event pointed at the
+    pre-existing head instead of the sibling snapshot.
+    """
+    paths = DataPaths(tmp_path / "data")
+    init_paths(paths)
+    watch = WatchSpec(name="concurrent", url="http://127.0.0.1/docs",
+                      interval_seconds=60)
+    client = _CountingClient()
+    runner = Runner(db_path=paths.db_path, archive_dir=paths.archive_dir,
+                    outbox_path=paths.outbox_path, rules=Rules(),
+                    client_factory=lambda rules: client)
+    runner.run(watch)  # seed version 1
+
+    results: list[object] = []
+    threads = [threading.Thread(target=lambda: results.append(runner.run(watch)))
+               for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    with connect(paths.db_path) as connection:
+        snapshots = list_snapshots(connection, watch.name)
+        events = list_events(connection)
+
+    assert [snapshot.version for snapshot in snapshots] == list(
+        range(1, len(snapshots) + 1))
+    ids = [snapshot.id for snapshot in snapshots]
+    # Events are listed by creation time, which can differ from chain order
+    # when workers finish in a different order; key them by their target.
+    by_target = {event.to_snapshot_id: event for event in events}
+    assert len(events) == len(snapshots) - 1
+    for index in range(1, len(snapshots)):
+        event = by_target[ids[index]]
+        assert event.from_snapshot_id == ids[index - 1]
+    assert all(not isinstance(result, Exception) for result in results)
+
+    # Retracing a snapshot's predecessor yields exactly the prior content.
+    for earlier, later in zip(snapshots, snapshots[1:]):
+        assert later.content_sha256 != earlier.content_sha256
+        assert later.version == earlier.version + 1
 
 
 def write_watchlist(path: Path, base_url: str) -> Path:

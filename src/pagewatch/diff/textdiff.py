@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import difflib
 
+TRUNCATION_MARKER = "... [diff truncated]"
+
 
 def split_lines(text: str) -> list[str]:
     return text.splitlines()
@@ -23,12 +25,24 @@ def changed_line_counts(old_text: str, new_text: str) -> tuple[int, int]:
 
 
 def truncate_text(text: str, max_chars: int | None) -> str:
+    """Cap *text* at *max_chars* without ever splitting a line.
+
+    Diff lines carry meaning in their leading marker (``+``, ``-``, `` ``,
+    ``@@``), so cutting at an arbitrary character offset would leave a
+    dangling, unbalanced fragment.  Truncation therefore happens only at a
+    line boundary and the marker is emitted as its own complete line.  If not
+    even one whole line fits, only the marker is returned.
+    """
     if max_chars is None or len(text) <= max_chars:
         return text
-    marker = "\n... [diff truncated]"
-    if max_chars <= len(marker):
+    marker = TRUNCATION_MARKER
+    if max_chars <= len(marker) + 1:
         return marker[:max_chars]
-    return text[: max_chars - len(marker)] + marker
+    budget = max_chars - len(marker) - 1
+    cut = text.rfind("\n", 0, budget + 1)
+    if cut <= 0:
+        return marker
+    return text[:cut] + "\n" + marker
 
 
 def unified_diff(old_text: str, new_text: str,

@@ -22,7 +22,7 @@ from .normalize.pipeline import (
     blocks_from_json, blocks_to_json, normalize_html,
 )
 from .schedule.backoff import next_due_at
-from .storage.db import connect, transaction
+from .storage.db import connect, immediate_transaction, transaction
 from .storage.events import add_audit, insert_alert, insert_event
 from .storage.snapshots import (
     append_snapshot, get_schedule, get_watch_state, latest_snapshot,
@@ -120,36 +120,39 @@ class Runner:
             noise_patterns=watch.noise_patterns,
             focus_selectors=rules.focus_selectors,
         )
-        previous = latest_snapshot(connection, watch.name)
         raw_hash = self._archive(result)
-        if previous is None:
-            snapshot = append_snapshot(
-                connection, watch_name=watch.name, fetched_at=checked_at,
-                status_code=result.status_code, url=watch.url, etag=result.etag,
-                last_modified=result.last_modified,
-                content_sha256=page.content_hash, raw_sha256=raw_hash,
-                normalized_text=page.text, blocks_json=blocks_to_json(page.blocks),
-                normalizer_version=page.normalizer_version,
-            )
-            self._schedule(connection, watch, checked_at, success=True,
-                           outcome="first")
-            connection.commit()
-            return WatchRunResult(watch.name, "first", snapshot_id=snapshot.id)
-        if page.content_hash == previous.content_sha256:
-            self._schedule(connection, watch, checked_at, success=True,
-                           outcome="unchanged")
-            connection.commit()
-            return WatchRunResult(watch.name, "unchanged",
-                                  snapshot_id=previous.id)
-        old_blocks = blocks_from_json(previous.blocks_json)
-        changes = diff_blocks(old_blocks, page.blocks)
-        metrics = compute_metrics(old_blocks, page.blocks, changes, watch.keywords)
-        severity = classify(metrics, rules)
-        summary = self._summary(severity, metrics, rules)
-        diff_text = unified_diff(previous.normalized_text, page.text,
-                                 rules.diff_max_chars)
-        alert = None
-        with transaction(connection):
+        # Re-read the chain head while holding the write lock.  The version
+        # number, diff base, event link and append all happen inside one
+        # IMMEDIATE transaction so concurrent workers advance the chain
+        # strictly one version per actual content change.
+        with immediate_transaction(connection):
+            previous = latest_snapshot(connection, watch.name)
+            if previous is None:
+                snapshot = append_snapshot(
+                    connection, watch_name=watch.name, fetched_at=checked_at,
+                    status_code=result.status_code, url=watch.url, etag=result.etag,
+                    last_modified=result.last_modified,
+                    content_sha256=page.content_hash, raw_sha256=raw_hash,
+                    normalized_text=page.text, blocks_json=blocks_to_json(page.blocks),
+                    normalizer_version=page.normalizer_version,
+                )
+                self._schedule(connection, watch, checked_at, success=True,
+                               outcome="first")
+                return WatchRunResult(watch.name, "first",
+                                      snapshot_id=snapshot.id)
+            if page.content_hash == previous.content_sha256:
+                self._schedule(connection, watch, checked_at, success=True,
+                               outcome="unchanged")
+                return WatchRunResult(watch.name, "unchanged",
+                                      snapshot_id=previous.id)
+            old_blocks = blocks_from_json(previous.blocks_json)
+            changes = diff_blocks(old_blocks, page.blocks)
+            metrics = compute_metrics(old_blocks, page.blocks, changes,
+                                      watch.keywords)
+            severity = classify(metrics, rules)
+            summary = self._summary(severity, metrics, rules)
+            diff_text = unified_diff(previous.normalized_text, page.text,
+                                     rules.diff_max_chars)
             snapshot = append_snapshot(
                 connection, watch_name=watch.name, fetched_at=checked_at,
                 status_code=result.status_code, url=watch.url, etag=result.etag,
@@ -169,6 +172,7 @@ class Runner:
             )
             if severity == "major":
                 mark_snapshot_major(connection, snapshot.id)
+            alert = None
             if should_alert(severity, rules):
                 alert = insert_alert(
                     connection, watch_name=watch.name, severity=severity,

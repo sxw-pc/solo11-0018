@@ -31,6 +31,31 @@ def test_line_diff_counts_and_truncation():
     assert truncate_text("short", 100) == "short"
 
 
+def test_truncation_always_cuts_at_a_complete_line_boundary():
+    """Truncated diffs must stay balanced: no dangling half-line fragments."""
+    old = "\n".join(f"line {index}" for index in range(40))
+    new = "\n".join(f"line {index}" + (" changed" if index % 4 == 0 else "")
+                    for index in range(40))
+    full = unified_diff(old, new)
+    for cap in (80, 97, 120, 200, 511):
+        truncated = unified_diff(old, new, max_chars=cap)
+        assert len(truncated) <= cap
+        lines = truncated.splitlines()
+        assert lines[-1] == "... [diff truncated]"
+        body = lines[:-1]
+        assert body, "at least one complete line should survive"
+        # Every emitted diff line is whole: it is either a plain prefix+text
+        # line or a complete header/hunk, never a clipped fragment.
+        assert all(line == "" or line[:1] in "+- @" for line in body)
+        assert all(line in full.splitlines() for line in body)
+
+
+def test_truncation_below_one_line_falls_back_to_the_marker_only():
+    marker_only = truncate_text("+" + "x" * 500, max_chars=25)
+    assert marker_only.endswith("[diff truncated]")
+    assert "\n" not in marker_only
+
+
 def test_block_alignment_groups_adjacent_replacements():
     old = blocks("alpha", "beta", "gamma", "delta")
     new = blocks("alpha", "BETA", "GAMMA", "delta")

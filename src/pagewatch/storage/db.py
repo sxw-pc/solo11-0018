@@ -145,6 +145,27 @@ def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
 
 
+@contextmanager
+def immediate_transaction(
+        connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Serialise a read-modify-write section across threads and processes.
+
+    ``BEGIN IMMEDIATE`` takes SQLite's RESERVED lock up front, so a version
+    number read inside this block cannot be observed as stale by another
+    writer.  Any implicit transaction opened by earlier statements is
+    committed first; without that the explicit BEGIN would be rejected.
+    """
+    if connection.in_transaction:
+        connection.commit()
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+
+
 def init_db(db_path: str | Path) -> None:
     with connect(db_path) as connection:
         connection.executescript(SCHEMA)

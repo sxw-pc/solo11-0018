@@ -92,12 +92,36 @@ def _candidate_elements(root: Tag) -> list[Tag]:
 
 
 def extract_blocks(soup: BeautifulSoup, roots: Iterable[Tag],
-                   focus_selectors: Sequence[str] = ()) -> list[dict[str, object]]:
+                   focus_selectors: Sequence[str] = (),
+                   *, document_scope: bool = True) -> list[dict[str, object]]:
+    """Extract ordered text blocks from *roots* only.
+
+    ``document_scope`` is true only when no include selector was configured.
+    With an explicit selection scope we never widen extraction to the whole
+    document: a selected root without block descendants contributes its own
+    text, and a selection that matches nothing yields no text at all.  This
+    keeps extraction (and therefore the content hash and diff) inside the
+    configured region, so excluded markup such as page footers cannot leak
+    back in through a fallback.
+    """
     focus_ids = {id(element) for selector in focus_selectors
                  for element in soup.select(selector)}
     values: list[dict[str, object]] = []
     for root in roots:
-        for element in _candidate_elements(root):
+        candidates = _candidate_elements(root)
+        if not candidates and not document_scope:
+            text = normalize_whitespace(root.get_text(" ", strip=True))
+            if not text:
+                continue
+            values.append({
+                "text": text,
+                "tag": root.name or "document",
+                "region": _region(root),
+                "is_focus": _is_focus(root, focus_ids),
+                "is_noise": _is_noise(root),
+            })
+            continue
+        for element in candidates:
             if _has_block_descendant(element):
                 continue
             text = normalize_whitespace(element.get_text(" ", strip=True))
@@ -110,7 +134,7 @@ def extract_blocks(soup: BeautifulSoup, roots: Iterable[Tag],
                 "is_focus": _is_focus(element, focus_ids),
                 "is_noise": _is_noise(element),
             })
-    if not values and soup.body is not None:
+    if not values and document_scope and soup.body is not None:
         text = normalize_whitespace(soup.body.get_text(" ", strip=True))
         if text:
             values.append({

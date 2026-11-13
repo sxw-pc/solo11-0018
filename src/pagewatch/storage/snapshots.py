@@ -84,6 +84,12 @@ def append_snapshot(connection: sqlite3.Connection, *, watch_name: str,
                     content_sha256: str, raw_sha256: str | None,
                     normalized_text: str, blocks_json: str,
                     normalizer_version: str) -> Snapshot:
+    """Append the next version to a watch's chain.
+
+    Callers that need a linear chain must already hold the database write
+    lock (see ``immediate_transaction``); otherwise two writers can compute
+    the same ``MAX(version)`` and fork the chain.
+    """
     row = connection.execute(
         "SELECT COALESCE(MAX(version), 0) + 1 AS next_version "
         "FROM snapshots WHERE watch_name=?",

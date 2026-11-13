@@ -46,7 +46,8 @@ def normalize_html(
     """
     soup = prepare_soup(html, exclude_selectors)
     roots = included_roots(soup, include_selectors)
-    raw_blocks = extract_blocks(soup, roots, focus_selectors)
+    raw_blocks = extract_blocks(soup, roots, focus_selectors,
+                                document_scope=not include_selectors)
     normalized: list[NormalizedBlock] = []
     for index, raw in enumerate(raw_blocks):
         masked = mask_noise(str(raw["text"]), noise_patterns)

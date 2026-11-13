@@ -67,6 +67,63 @@ def test_include_and_exclude_selectors_limit_scope(fixtures_dir):
     assert "Release notes" in page.text
 
 
+def test_include_scope_never_widens_to_the_whole_document():
+    """A selected region may be a bare element; extraction must stay there.
+
+    Regression: when the selected roots produced no block-level descendants,
+    extraction used to fall back to ``soup.body`` and swallow every other
+    region, so an excluded page footer leaked back into the content hash.
+    """
+    html = """<html><head><title>Example</title></head><body>
+<div id="title">Example</div>
+<main><p>stable body</p></main>
+<footer class="muted">Copyright 2025 Example</footer></body></html>"""
+    config = dict(include_selectors=["#title"],
+                  exclude_selectors=[".ad"],
+                  noise_patterns=[r"更新时间[：:]\s*[0-9:\- ]+"])
+    baseline = normalize_html(html, **config)
+    after_year_change = normalize_html(html.replace("2025", "2026"), **config)
+    assert [block.text for block in baseline.blocks] == ["Example"]
+    assert baseline.content_hash == after_year_change.content_hash
+
+    # Removing the exclude selector must not change which region is compared;
+    # it only removes markup that never belonged to the scope.
+    without_exclude = dict(config)
+    without_exclude.pop("exclude_selectors")
+    plain = normalize_html(html, **without_exclude)
+    changed = normalize_html(html.replace("2025", "2026"), **without_exclude)
+    assert [block.text for block in plain.blocks] == ["Example"]
+    assert plain.content_hash == changed.content_hash
+    assert baseline.content_hash == plain.content_hash
+
+
+def test_excluding_the_only_selected_root_shrinks_scope_instead_of_widening():
+    """If excludes remove every selected root, the scope is empty.
+
+    This is the shape that made a footer year appear only when an exclude
+    selector was configured: the removed root left an empty selection, which
+    must not fall back to whole-body extraction.
+    """
+    html = """<html><body>
+<div class="analytics"><header id="title"><h1>Example</h1></header></div>
+<main><p>stable body</p></main>
+<footer>Copyright 2025 Example</footer></body></html>"""
+    scoped = normalize_html(html, include_selectors=["#title"],
+                            exclude_selectors=[".analytics"])
+    assert scoped.blocks == ()
+    assert scoped.text == ""
+    assert scoped.content_hash == normalize_html(
+        html.replace("2025", "2026"), include_selectors=["#title"],
+        exclude_selectors=[".analytics"]).content_hash
+
+
+def test_include_scope_that_matches_nothing_yields_no_text():
+    page = normalize_html("<html><body><footer>Copyright 2025</footer></body></html>",
+                          include_selectors=["#missing"])
+    assert page.blocks == ()
+    assert page.text == ""
+
+
 def test_whitespace_normalization_and_fallback_body():
     page = normalize_html("<html><body><main> a\n\t b   c </main></body></html>")
     assert page.text == "a b c"
