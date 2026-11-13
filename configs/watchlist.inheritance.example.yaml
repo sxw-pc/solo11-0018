@@ -1,0 +1,67 @@
+version: 1
+# Inheritance example: shared templates + extends + generate expansion.
+# All targets are the bundled local mock site. pagewatch's built-in
+# allowlist rejects every host except 127.0.0.1, localhost and ::1.
+#
+# Merge semantics:
+#   - name, url and interval_seconds are identity fields: every concrete
+#     watch must declare its own; templates must not contain them and they
+#     are never inherited.
+#   - Every other field resolves nearest-first along the extends chain;
+#     a field declared on the child replaces the ancestor's value wholesale
+#     (declare an empty list, e.g. `tags: []`, to clear an inherited list).
+#   - rule_overrides merges key by key, nearest key wins.
+templates:
+  local-base:
+    exclude_selectors: [".analytics"]
+    enabled: true
+    rule_overrides:
+      alert_cooldown_seconds: 600
+  notice-area:
+    extends: local-base
+    tags: [notice]
+    include_selectors: ["#notice-area"]
+    keywords: ["重要", "计费"]
+  noisy-page:
+    extends: local-base
+    tags: [status, noisy]
+    include_selectors: ["main"]
+    noise_patterns:
+      - '当前访问计数[：:]\s*\d+'
+      - '更新时间[：:]\s*[0-9:\- ]+'
+      - '随机会话[：:]\s*[A-Za-z0-9_-]+'
+
+watches:
+  - name: announcements
+    extends: notice-area
+    url: http://127.0.0.1:8765/announcements
+    interval_seconds: 300
+    tags: [notice, priority]          # replaces the template's tags wholesale
+
+  - name: noisy-status
+    extends: noisy-page
+    url: http://127.0.0.1:8765/noisy
+    interval_seconds: 120
+
+  - name: pricing
+    extends: local-base
+    url: http://127.0.0.1:8765/pricing
+    interval_seconds: 600
+    tags: [pricing]
+    include_selectors: ["#price-table"]
+    exclude_selectors: [".ad"]        # replaces inherited [".analytics"]
+    keywords: ["价格", "月费"]
+
+  # Batch expansion: template + path suffixes -> one watch per path.
+  # Names derive from name_prefix + slug(path) unless overridden per entry.
+  - generate:
+      extends: notice-area
+      base_url: http://127.0.0.1:8765
+      name_prefix: mirror-
+      interval_seconds: 900
+      include_selectors: ["#doc-body"]  # generate-level override for the batch
+      tags: [docs]
+      paths:
+        - docs                          # -> mirror-docs
+        - path: announcements           # -> mirror-announcements
+          interval_seconds: 300

@@ -10,7 +10,9 @@ from pathlib import Path
 
 from . import __version__
 from .clock import Clock, SystemClock, parse_iso, utc_iso
-from .config import ConfigError, load_all, load_rules
+from .config import (
+    ConfigError, dump_flat_watchlist, load_all, load_rules, load_watchlist,
+)
 from .fetch.allowlist import is_host_allowed
 from .models import DataPaths
 from .retention.compact import compact
@@ -43,6 +45,14 @@ def _parser() -> argparse.ArgumentParser:
     check.add_argument("--config", default=DEFAULT_WATCHLIST)
     check.add_argument("--rules", default=DEFAULT_RULES)
     check.set_defaults(func=_cmd_check_config)
+
+    export = sub.add_parser(
+        "export-config",
+        help="resolve inheritance and export a flat watchlist for audit/replay")
+    export.add_argument("--config", default=DEFAULT_WATCHLIST)
+    export.add_argument("--output", default=None,
+                        help="write the flattened watchlist here (default: stdout)")
+    export.set_defaults(func=_cmd_export_config)
 
     run = sub.add_parser("run-once", help="run one monitoring round")
     run.add_argument("--config", default=DEFAULT_WATCHLIST)
@@ -89,6 +99,17 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
           f"max_workers={rules.max_workers}, keep_last={rules.keep_last}")
     for watch in watches:
         print(f"  {watch.name}: {watch.url} every {watch.interval_seconds}s")
+    return 0
+
+
+def _cmd_export_config(args: argparse.Namespace) -> int:
+    watches = load_watchlist(args.config)
+    text = dump_flat_watchlist(watches, source=str(args.config))
+    if args.output:
+        Path(args.output).write_text(text, encoding="utf-8")
+        print(f"exported {len(watches)} flat watch(es) to {args.output}")
+    else:
+        sys.stdout.write(text)
     return 0
 
 

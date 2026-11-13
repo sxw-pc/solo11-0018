@@ -105,6 +105,7 @@ watches:
 | `name` | 是 | — | 唯一监视项名称；用于数据库与摘要分组 |
 | `url` | 是 | — | 绝对 http(s) URL，不可含凭据，主机必须在本地白名单 |
 | `interval_seconds` | 是 | — | 周期，整数，下界 `10` 秒 |
+| `extends` | 否 | — | 继承某个模板或另一个监视项（见下文“继承与批量生成”） |
 | `tags` | 否 | `[]` | 用于 `--tag` 过滤 |
 | `include_selectors` | 否 | `[]` | 只提取匹配 CSS 选择器的区域；空表示全文 |
 | `exclude_selectors` | 否 | `[]` | 比较前从 DOM 移除的区域 |
@@ -112,6 +113,67 @@ watches:
 | `keywords` | 否 | `[]` | 变更后文本命中任一关键词即判 major |
 | `enabled` | 否 | `true` | 关闭后不参与调度 |
 | `rule_overrides` | 否 | `{}` | 逐监视项覆盖全局 rules 的扁平字段 |
+
+### 继承与批量生成（templates / extends / generate）
+
+同一站点的一批子页通常只有 url 不同。可以把公共字段收进顶层 `templates:`，
+监视项用 `extends` 指向**模板名或另一个监视项名**，只声明差异字段；也可以用
+`generate` 按“模板 + 一组路径后缀”批量展开。完整示例见
+`configs/watchlist.inheritance.example.yaml`。
+
+```yaml
+version: 1
+templates:
+  notice-area:                 # 模板：只含可继承字段，自身不被监测
+    tags: [notice]
+    include_selectors: ["#notice-area"]
+    keywords: ["重要", "计费"]
+    rule_overrides:
+      alert_cooldown_seconds: 600
+
+watches:
+  - name: announcements
+    extends: notice-area       # 未声明的字段从祖先逐层向上取
+    url: http://127.0.0.1:8765/announcements
+    interval_seconds: 300
+    tags: [notice, priority]   # 已声明的字段整体覆盖祖先值
+
+  - generate:                  # 批量展开：模板 + 路径后缀
+      extends: notice-area
+      base_url: http://127.0.0.1:8765
+      name_prefix: mirror-
+      interval_seconds: 900
+      paths:
+        - docs                                   # -> mirror-docs
+        - { path: announcements, interval_seconds: 300 }
+```
+
+规则：
+
+- **身份字段不继承**：`name`、`url`、`interval_seconds` 必须每个具体监视项自己声明；
+  模板里出现这三个字段、或子项缺少其中任何一个，都会报错并指向具体条目。
+  对 `generate` 而言，url 由 `base_url + path` 派生，name 由
+  `name_prefix + 路径slug` 派生（可用条目级 `name` 显式覆盖），
+  `interval_seconds` 在 generate 块或单个 path 条目上声明。
+- **就近覆盖**：标量/列表字段（如 `tags`、`include_selectors`）整字段替换，
+  显式写空列表（`tags: []`）可清空继承值；`rule_overrides` 按键逐层合并、就近键胜出。
+- **链式继承**：模板可继承模板、监视项可继承监视项；循环继承、未知继承目标、
+  模板与监视项同名都会在加载时报错并给出位置（如 `templates.a`、`watches[2] (name)`）。
+- **整批拒绝**：展开结果与手写项走完全相同的校验和唯一性检查；任一条目无效或
+  重名（包括批次内部、与既有项冲突）都会拒绝整个文件并列出全部冲突项及来源，
+  不会部分生效。
+- 校验错误始终指向字段的**原始声明位置**（继承自模板的错误指向 `templates.<名>`），
+  而不是只报展开后的名字。
+- `run-once` 的 `--tag` 过滤、逐项 `rule_overrides` 和按名称错峰调度都作用在解析后的
+  扁平监视项上，与全手写配置行为一致。
+
+解析后的扁平配置可导出用于审计和回放；导出文件不含 `extends`/`templates`，
+可直接作为普通 watchlist 重新喂回程序，得到完全等价的配置：
+
+```bash
+pagewatch export-config --config configs/watchlist.inheritance.example.yaml \
+                        --output data/flat-watchlist.yaml
+```
 
 ### rules.yaml
 
@@ -133,7 +195,9 @@ watches:
 
 变更率定义为 `(新增行 + 删除行) / max(旧行数, 新行数, 1)`。分级优先级：
 `focus/keyword/high-rate → major`；否则 `noise-only 或低于噪声下界 → noise`；其余 `minor`。
-`check-config` 会校验缺字段、未知字段、URL/凭据/白名单、CSS/正则语法、间隔下界、重复名称和规则范围，错误信息带文件与条目定位。
+`check-config` 会校验缺字段、未知字段、URL/凭据/白名单、CSS/正则语法、间隔下界、
+重复名称（含 generate 展开后）、循环/悬空继承、模板与监视项同名和规则范围，
+错误信息带文件与条目定位。
 
 ## 命令参考
 
@@ -141,6 +205,10 @@ watches:
 # 校验配置
 pagewatch check-config --config configs/watchlist.example.yaml \
                        --rules configs/rules.example.yaml
+
+# 导出解析后的扁平 watchlist（审计/回放；无 extends/templates 残留）
+pagewatch export-config --config configs/watchlist.inheritance.example.yaml \
+                        --output data/flat-watchlist.yaml
 
 # 单轮监测：全量或按 name/tag 过滤；--due-only 只跑到期项
 pagewatch run-once --data-dir data --tag priority
