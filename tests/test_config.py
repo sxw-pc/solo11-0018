@@ -6,7 +6,8 @@ import pytest
 import yaml
 
 from pagewatch.config import (
-    ConfigError, effective_rules, load_rules, load_watchlist,
+    ConfigError, RuleOverrides, WatchSpec, effective_rules, load_all,
+    load_rules, load_watchlist, strip_unknown_fields,
 )
 from pagewatch.models import Rules
 
@@ -123,3 +124,153 @@ def test_rules_validation(tmp_path):
     with pytest.raises(ConfigError, match="major_keep_forever"):
         load_rules(write_rules(tmp_path, {
             "retention": {"major_keep_forever": "not-a-bool"}}))
+
+
+# ---------------------------------------------------------------------------
+# Pydantic migration behaviour
+# ---------------------------------------------------------------------------
+
+def test_loaded_objects_are_typed_pydantic_models():
+    watches = load_watchlist(ROOT / "configs/watchlist.example.yaml")
+    rules = load_rules(ROOT / "configs/rules.example.yaml")
+    assert isinstance(watches[0], WatchSpec)
+    assert isinstance(rules, Rules)
+    assert isinstance(watches[0].rule_overrides, RuleOverrides)
+    # Frozen: callers cannot mutate configuration in place.
+    with pytest.raises(Exception):
+        watches[0].enabled = False
+
+
+def test_default_list_fields_are_independent_and_immutable():
+    first = WatchSpec(name="a", url="http://127.0.0.1/a", interval_seconds=60)
+    second = WatchSpec(name="b", url="http://127.0.0.1/b", interval_seconds=60)
+    assert first.tags == () and first.keywords == ()
+    assert first.rule_overrides is not second.rule_overrides
+    with pytest.raises(AttributeError):
+        first.tags.append("shared")
+
+
+def test_error_details_identify_watch_field_and_rule():
+    # noise=0.9 is valid on its own but violates the ordering against a
+    # stricter global major threshold, so the failure surfaces at merge time.
+    bad = WatchSpec(
+        name="loc", url="http://127.0.0.1/x", interval_seconds=60,
+        rule_overrides=RuleOverrides(noise_max_change_rate=0.9))
+    with pytest.raises(ConfigError) as error:
+        effective_rules(Rules(major_change_rate=0.5), bad)
+    payload = error.value.error_payload()
+    assert payload["error"] == "config_validation_failed"
+    assert "loc" in str(error.value)
+    assert "must not exceed" in str(error.value)
+
+
+def test_json_payload_aggregates_multiple_errors(tmp_path):
+    path = write_watchlist(tmp_path, [watch(interval_seconds=3, enabled="yes")])
+    with pytest.raises(ConfigError) as error:
+        load_watchlist(path)
+    details = error.value.error_payload()["details"]
+    fields = {item["field"] for item in details}
+    assert {"interval_seconds", "enabled"} <= fields
+    locations = [item["location"] for item in details]
+    assert all("watches[0]" in loc for loc in locations)
+
+
+def test_unknown_fields_rejected_by_default_at_every_level(tmp_path):
+    top = tmp_path / "top.yaml"
+    top.write_text(yaml.safe_dump({
+        "version": 1, "future": 1,
+        "watches": [watch()],
+    }), encoding="utf-8")
+    with pytest.raises(ConfigError, match="unknown top-level"):
+        load_watchlist(top)
+
+    nested = write_watchlist(tmp_path, [watch(rule_overrides={"typo_key": 1})])
+    with pytest.raises(ConfigError) as error:
+        load_watchlist(nested)
+    assert "unknown field(s): typo_key" in str(error.value)
+    assert "rule_overrides" in error.value.details[0]["location"]
+
+
+def test_allow_unknown_fields_tolerates_top_and_nested_keys(tmp_path):
+    path = tmp_path / "tolerant.yaml"
+    path.write_text(yaml.safe_dump({
+        "version": 1, "future_top": True,
+        "watches": [watch(unknown_watch_key=9, rule_overrides={
+            "max_workers": 2, "future_override": "x"})],
+    }), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_watchlist(path)
+    watches = load_watchlist(path, allow_unknown_fields=True)
+    assert watches[0].rule_overrides.max_workers == 2
+    assert watches[0].rule_overrides.merged_values() == {"max_workers": 2}
+
+
+def test_allow_unknown_fields_tolerates_rules_sections(tmp_path):
+    path = write_rules(tmp_path, {
+        "future_section": {"x": 1},
+        "schedule": {"max_workers": 1, "future_knob": 2},
+    })
+    with pytest.raises(ConfigError, match="unknown top-level"):
+        load_rules(path)
+    rules = load_rules(path, allow_unknown_fields=True)
+    assert rules.max_workers == 1
+
+
+def test_deep_merge_keeps_unrelated_overrides_and_global_defaults():
+    base = Rules()
+    watch_spec = WatchSpec(
+        name="w", url="http://127.0.0.1/w", interval_seconds=60,
+        rule_overrides=RuleOverrides(
+            major_change_rate=0.5, focus_selectors=("#notice",)))
+    merged = effective_rules(base, watch_spec)
+    assert merged.major_change_rate == 0.5
+    assert merged.focus_selectors == ("#notice",)
+    # Unmentioned global rules survive the merge.
+    assert merged.max_workers == base.max_workers
+    assert merged.alert_cooldown_seconds == base.alert_cooldown_seconds
+    # The global base is never mutated.
+    assert base.major_change_rate == 0.35 and base.focus_selectors == ()
+
+
+def test_partial_override_vs_global_base_rate_ordering_fails_at_load(tmp_path):
+    # Override lowers major below the global noise floor.
+    path = write_watchlist(tmp_path, [watch(rule_overrides={
+        "major_change_rate": 0.001})])
+    rules_path = write_rules(tmp_path, {"classification": {
+        "noise_max_change_rate": 0.5}})
+    with pytest.raises(ConfigError, match="must not exceed"):
+        load_all(path, rules_path)
+
+
+def test_no_overrides_returns_same_rules_instance():
+    base = Rules()
+    watch_spec = WatchSpec(name="w", url="http://127.0.0.1/w",
+                           interval_seconds=60)
+    assert effective_rules(base, watch_spec) is base
+
+
+def test_explicit_null_override_is_rejected_but_null_watch_fields_default(tmp_path):
+    path = write_watchlist(tmp_path, [
+        watch(rule_overrides={"max_workers": None})])
+    with pytest.raises(ConfigError, match="must not be null"):
+        load_watchlist(path)
+
+    nulls = tmp_path / "nulls.yaml"
+    nulls.write_text(yaml.safe_dump({
+        "version": 1,
+        "watches": [dict(watch(), tags=None, keywords=None,
+                         rule_overrides=None)],
+    }), encoding="utf-8")
+    loaded = load_watchlist(nulls)[0]
+    assert loaded.tags == () and loaded.keywords == ()
+    assert loaded.rule_overrides.merged_values() == {}
+
+
+def test_strip_unknown_fields_recurses_into_nested_models():
+    raw = {
+        "name": "w", "bogus": 1,
+        "rule_overrides": {"max_workers": 2, "nested_bogus": 3},
+    }
+    cleaned = strip_unknown_fields(raw, WatchSpec)
+    assert "bogus" not in cleaned
+    assert cleaned["rule_overrides"] == {"max_workers": 2}

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
 
 from pagewatch.fetch.archive import write_archive
 from pagewatch.models import Rules, Snapshot
@@ -87,8 +86,9 @@ def test_compact_dry_run_then_execute_is_idempotent(tmp_path):
         connection.commit()
     orphan_path, _, _ = write_archive(b"orphan", archive_dir)
     os.utime(orphan_path, (NOW - 10 * 86_400, NOW - 10 * 86_400))
-    rules = replace(Rules(), keep_last=1, major_keep_forever=True,
-                    archive_max_age_days=1)
+    rules = Rules().model_copy(update={
+        "keep_last": 1, "major_keep_forever": True,
+        "archive_max_age_days": 1})
 
     dry = compact(db_path, archive_dir, rules, NOW, dry_run=True)
     assert dry.executed is False

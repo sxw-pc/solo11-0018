@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
-
 import pytest
 
 from pagewatch.alert.rules import alert_message, should_alert
@@ -20,7 +18,8 @@ def metric(**overrides):
 
 
 def test_severity_boundaries():
-    rules = replace(Rules(), noise_max_change_rate=0.02, major_change_rate=0.5)
+    rules = Rules().model_copy(update={
+        "noise_max_change_rate": 0.02, "major_change_rate": 0.5})
     assert classify(metric(change_rate=0.019), rules) == "noise"
     assert classify(metric(change_rate=0.02), rules) == "minor"
     assert classify(metric(change_rate=0.499), rules) == "minor"
@@ -61,5 +60,5 @@ def test_reasons_and_alert_eligibility():
     ("noise", False), ("minor", False), ("major", True),
 ])
 def test_custom_alert_severities(severity, expected):
-    rules = replace(Rules(), alert_severities=("major",))
+    rules = Rules().model_copy(update={"alert_severities": ("major",)})
     assert should_alert(severity, rules) is expected

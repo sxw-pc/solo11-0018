@@ -30,6 +30,15 @@ def build_clock() -> Clock:
     return SystemClock()
 
 
+def _add_config_tolerance(parser: argparse.ArgumentParser) -> None:
+    """Shared opt-in flags for every subcommand that parses YAML config."""
+    parser.add_argument(
+        "--allow-unknown-fields", action="store_true",
+        help="ignore fields the configuration models do not declare instead "
+             "of failing (unknown fields are rejected by default)",
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="pagewatch",
@@ -37,11 +46,17 @@ def _parser() -> argparse.ArgumentParser:
                     "to 127.0.0.1, localhost and ::1 only.",
     )
     parser.add_argument("--version", action="version", version=__version__)
+    parser.add_argument(
+        "--json-errors", action="store_true",
+        help="print configuration errors as a JSON document on stderr instead "
+             "of a plain-text message (exit code stays 2)",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     check = sub.add_parser("check-config", help="validate watchlist and rules files")
     check.add_argument("--config", default=DEFAULT_WATCHLIST)
     check.add_argument("--rules", default=DEFAULT_RULES)
+    _add_config_tolerance(check)
     check.set_defaults(func=_cmd_check_config)
 
     run = sub.add_parser("run-once", help="run one monitoring round")
@@ -53,6 +68,7 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--due-only", action="store_true",
                      help="only watches whose persisted next_due_at has passed")
     run.add_argument("--json", action="store_true", help="print results as JSON")
+    _add_config_tolerance(run)
     run.set_defaults(func=_cmd_run_once)
 
     digest = sub.add_parser("digest", help="write a static HTML change digest")
@@ -69,6 +85,7 @@ def _parser() -> argparse.ArgumentParser:
     compact_cmd.add_argument("--rules", default=DEFAULT_RULES)
     compact_cmd.add_argument("--data-dir", default="data")
     compact_cmd.add_argument("--dry-run", action="store_true")
+    _add_config_tolerance(compact_cmd)
     compact_cmd.set_defaults(func=_cmd_compact)
 
     status = sub.add_parser("serve-status", help="serve read-only status on localhost")
@@ -83,7 +100,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _cmd_check_config(args: argparse.Namespace) -> int:
-    watches, rules = load_all(args.config, args.rules)
+    watches, rules = load_all(
+        args.config, args.rules,
+        allow_unknown_fields=args.allow_unknown_fields)
     enabled = sum(1 for watch in watches if watch.enabled)
     print(f"config OK: {len(watches)} watch(es), {enabled} enabled; "
           f"max_workers={rules.max_workers}, keep_last={rules.keep_last}")
@@ -93,7 +112,9 @@ def _cmd_check_config(args: argparse.Namespace) -> int:
 
 
 def _cmd_run_once(args: argparse.Namespace) -> int:
-    watches, rules = load_all(args.config, args.rules)
+    watches, rules = load_all(
+        args.config, args.rules,
+        allow_unknown_fields=args.allow_unknown_fields)
     paths = DataPaths(Path(args.data_dir))
     init_paths(paths)
     clock = build_clock()
@@ -144,7 +165,8 @@ def _cmd_digest(args: argparse.Namespace) -> int:
 
 
 def _cmd_compact(args: argparse.Namespace) -> int:
-    rules = load_rules(args.rules)
+    rules = load_rules(args.rules,
+                       allow_unknown_fields=args.allow_unknown_fields)
     paths = DataPaths(Path(args.data_dir))
     if not paths.db_path.exists():
         raise FileNotFoundError(f"database not found: {paths.db_path}")
@@ -181,7 +203,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except (ConfigError, FileNotFoundError, ValueError, RuntimeError) as exc:
+    except ConfigError as exc:
+        if getattr(args, "json_errors", False):
+            print(json.dumps(exc.error_payload(), ensure_ascii=False,
+                             indent=2, sort_keys=True), file=sys.stderr)
+        else:
+            print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

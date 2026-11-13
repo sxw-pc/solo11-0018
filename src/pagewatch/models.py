@@ -1,41 +1,24 @@
-"""Typed data structures shared across pagewatch."""
+"""Typed data structures shared across pagewatch.
+
+Configuration models (``WatchSpec``, ``Rules``, ``RuleOverrides``) are
+Pydantic v2 models defined in :mod:`pagewatch.config`; they are re-exported
+here so existing ``from pagewatch.models import ...`` call sites keep working.
+Everything else remains a frozen dataclass.
+"""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import RuleOverrides, Rules, WatchSpec
 
-@dataclass(frozen=True)
-class WatchSpec:
-    name: str
-    url: str
-    interval_seconds: int
-    tags: tuple[str, ...] = ()
-    include_selectors: tuple[str, ...] = ()
-    exclude_selectors: tuple[str, ...] = ()
-    noise_patterns: tuple[str, ...] = ()
-    keywords: tuple[str, ...] = ()
-    enabled: bool = True
-    rules_overrides: dict[str, Any] = field(default_factory=dict, compare=False)
-
-
-@dataclass(frozen=True)
-class Rules:
-    noise_max_change_rate: float = 0.02
-    major_change_rate: float = 0.35
-    focus_selectors: tuple[str, ...] = ()
-    alert_severities: tuple[str, ...] = ("major",)
-    alert_cooldown_seconds: int = 3600
-    diff_max_chars: int = 12_000
-    keep_last: int = 5
-    major_keep_forever: bool = True
-    archive_max_age_days: int = 30
-    max_workers: int = 4
-    jitter_seconds: int = 10
-    timeout_seconds: float = 5.0
-    max_bytes: int = 2_097_152
+__all__ = [
+    "WatchSpec", "Rules", "RuleOverrides", "DataPaths", "NormalizedBlock",
+    "NormalizedPage", "ChangeBlock", "DiffMetrics", "Snapshot", "ChangeEvent",
+    "AlertRecord",
+]
 
 
 @dataclass(frozen=True)
