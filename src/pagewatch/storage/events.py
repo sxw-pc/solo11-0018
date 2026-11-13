@@ -122,6 +122,24 @@ def insert_alert(connection: sqlite3.Connection, *, watch_name: str,
     return _alert(row) if row else None
 
 
+def delete_events(connection: sqlite3.Connection, ids: Iterable[int]) -> int:
+    values = [int(item) for item in ids]
+    if not values:
+        return 0
+    before = connection.total_changes
+    connection.executemany("DELETE FROM events WHERE id=?", [(item,) for item in values])
+    return connection.total_changes - before
+
+
+def delete_alerts(connection: sqlite3.Connection, ids: Iterable[int]) -> int:
+    values = [int(item) for item in ids]
+    if not values:
+        return 0
+    before = connection.total_changes
+    connection.executemany("DELETE FROM alerts WHERE id=?", [(item,) for item in values])
+    return connection.total_changes - before
+
+
 def list_alerts(connection: sqlite3.Connection) -> list[AlertRecord]:
     rows = connection.execute("SELECT * FROM alerts ORDER BY id").fetchall()
     return [_alert(row) for row in rows]

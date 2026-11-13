@@ -170,7 +170,8 @@ pagewatch demo
 data/
   pagewatch.sqlite          # 元数据、快照链、事件、告警、调度、审计
   archive/<sha256>.gz       # 按原始响应内容寻址；gzip mtime=0，自动去重
-  outbox/alerts.jsonl       # 追加式告警落盘；只写本机
+  outbox/alerts.jsonl       # 追加式告警落盘；只写本机；compact 时经 .lock 串行化后原子重写
+  outbox/alerts.jsonl.lock  # append 与 compact 重写共用的咨询锁文件
   out/digest.html           # digest 默认输出
 ```
 
@@ -192,7 +193,7 @@ SQLite 表概览：
 - **归一化器版本**：快照记录 `normalizer-v1`，便于未来重算比对。
 - **调度**：每项独立周期 + 基于名称哈希的确定性错峰；失败按 `interval × 2^failures` 指数退避且封顶 1 小时；恢复成功立即归零。下次时间从“当前时刻”计算，错过超过一轮不补跑。
 - **告警**：命中 `alert.severities` 后先写 SQLite，再追加 JSONL；冷却期内同监视项同级重复告警被去重。
-- **保留**：`compact` 按监视项保留最新 N 版，major 目标版本豁免；未被任何保留快照引用的旧 gzip 超期后删除。执行幂等并累计统计。
+- **保留（级联 compact）**：一次 compact 在同一判定口径下同时决定四类数据的去留——快照行、引用这些快照的 `events` 行、对应 `alerts` 行及其 `alerts.jsonl` 镜像行、未被任何保留快照引用且超期的 gzip。按监视项保留最新 N 版（`keep_last` 口径不变），major 事件目标版本永久豁免；时间下界 `not_after` 保证并发调度器在本轮之后写入的快照不会被当垃圾清理，`archive_max_age_days` 只约束未被引用的 gzip。执行上 SQLite 侧用单事务包住事件/告警/快照删除（失败整体回滚），JSONL 侧先写临时文件再 `os.replace` 原子替换（与追加共用文件锁），gzip 最后删除；整个流程可重跑收敛，任何一步失败都不会留下半删状态，并顺带修复历史遗留的悬挂引用。
 
 outbox 每行示例（虚构）：
 

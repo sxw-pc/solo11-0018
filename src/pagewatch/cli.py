@@ -149,12 +149,14 @@ def _cmd_compact(args: argparse.Namespace) -> int:
     if not paths.db_path.exists():
         raise FileNotFoundError(f"database not found: {paths.db_path}")
     clock = build_clock()
-    result = compact(paths.db_path, paths.archive_dir, rules, clock.now(),
-                     dry_run=args.dry_run)
+    result = compact(paths.db_path, paths.archive_dir, paths.outbox_path, rules,
+                     clock.now(), dry_run=args.dry_run)
     print(("DRY RUN (no changes)\n" if args.dry_run else "COMPACT\n")
           + format_plan(result.plan))
     if result.executed:
         print(f"removed {result.removed_snapshots} snapshot(s), "
+              f"{result.removed_events} event(s), "
+              f"{result.removed_alerts} alert(s), "
               f"{result.removed_archives} archive(s), {result.removed_bytes} bytes")
     return 0
 
