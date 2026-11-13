@@ -79,6 +79,33 @@ def _parser() -> argparse.ArgumentParser:
 
     demo = sub.add_parser("demo", help="run the bundled end-to-end demo")
     demo.set_defaults(func=_cmd_demo)
+
+    push = sub.add_parser(
+        "push",
+        help="incrementally replicate snapshots, events and outbox to a peer "
+             "local directory (resumable, content-addressed batches)",
+    )
+    push.add_argument("--data-dir", default="data",
+                      help="source data directory (holds pagewatch.sqlite)")
+    push.add_argument("--target-dir", required=True,
+                      help="peer data directory to receive the replicated "
+                           "database, archive and outbox")
+    push.add_argument("--spool-dir", default=None,
+                      help="shared staging directory (default: "
+                           "<target-dir>/.sync-spool)")
+    push.add_argument("--max-items", type=int, default=500)
+    push.add_argument("--max-bytes", type=int, default=64 * 1024 * 1024)
+    push.set_defaults(func=_cmd_push)
+
+    pull = sub.add_parser(
+        "pull",
+        help="apply replication batches already staged in a spool directory",
+    )
+    pull.add_argument("--data-dir", default="data",
+                      help="local data directory that receives the batches")
+    pull.add_argument("--spool-dir", required=True,
+                      help="spool directory populated by a peer push")
+    pull.set_defaults(func=_cmd_pull)
     return parser
 
 
@@ -174,6 +201,62 @@ def _cmd_serve_status(args: argparse.Namespace) -> int:
 def _cmd_demo(_: argparse.Namespace) -> int:
     from .demo import run_demo
     return run_demo()
+
+
+def _sync_paths(data_dir: str) -> DataPaths:
+    paths = DataPaths(Path(data_dir))
+    if not paths.db_path.exists():
+        raise FileNotFoundError(f"database not found: {paths.db_path}")
+    return paths
+
+
+def _cmd_push(args: argparse.Namespace) -> int:
+    from .sync import SyncError, push
+    from .sync.locking import LockBusy
+
+    source = _sync_paths(args.data_dir)
+    target = DataPaths(Path(args.target_dir))
+    spool = Path(args.spool_dir) if args.spool_dir \
+        else target.root / ".sync-spool"
+    clock = build_clock()
+    try:
+        report = push(
+            source_db=source.db_path, source_archive=source.archive_dir,
+            source_outbox=source.outbox_path, target_db=target.db_path,
+            target_archive=target.archive_dir, target_outbox=target.outbox_path,
+            spool_dir=spool, now=clock.now(),
+            max_items=args.max_items, max_bytes=args.max_bytes,
+        )
+    except LockBusy as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except SyncError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(report.render())
+    return 0 if not report.failed else 2
+
+
+def _cmd_pull(args: argparse.Namespace) -> int:
+    from .sync import SyncError, pull
+    from .sync.locking import LockBusy
+
+    target = DataPaths(Path(args.data_dir))
+    clock = build_clock()
+    try:
+        report = pull(
+            target_db=target.db_path, target_archive=target.archive_dir,
+            target_outbox=target.outbox_path, spool_dir=Path(args.spool_dir),
+            now=clock.now(),
+        )
+    except LockBusy as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+    except SyncError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(report.render())
+    return 0 if not report.failed else 2
 
 
 def main(argv: list[str] | None = None) -> int:

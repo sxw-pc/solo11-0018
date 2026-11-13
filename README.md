@@ -158,6 +158,11 @@ pagewatch compact --data-dir data
 # 只读状态页，只允许绑定 127.0.0.1
 pagewatch serve-status --data-dir data --port 8766
 
+# 增量同步：把快照/事件/outbox/ gzip 推到对端本地目录（可中断续传）
+pagewatch push --data-dir data --target-dir /srv/peer/data
+# 对端也可只拉取已暂存在共享 spool 中的批次
+pagewatch pull --data-dir /srv/peer/data --spool-dir /srv/peer/data/.sync-spool
+
 # 演示；也可 python -m pagewatch.demo
 pagewatch demo
 ```
@@ -200,6 +205,45 @@ outbox 每行示例（虚构）：
 {"created_at":1767225900.0,"dedup_key":"announcements:major","event_id":2,"id":1,"message":"watch=announcements severity=major event=2 change_rate=0.2860","outbox_version":1,"severity":"major","watch_name":"announcements"}
 ```
 
+## 增量同步链路（push / pull）
+
+同步在既有快照版本链、事件台账、gzip 留档与 outbox 之上，新增一条**面向对端本地目录**的复制链路，用于机器迁移或双机热备；它不发起任何网络连接，只通过一个共享的本地 spool 目录交接批次（可放在挂载盘、U盘或由 rsync/带外方式搬运）。
+
+### 传输单位与完整性取舍：内容寻址批次清单
+
+三类传输单元——原始 gzip、规范化快照行、事件/outbox 行——带有硬跨引用（事件引用两个快照 id、outbox 行引用事件 id）。设计上把一个传输窗口封装成**一个批次（batch）**，并以内容寻址哈希作为批次清单：
+
+- 每个负载按 `blobs/<sha256>` 内容寻址存一份；相同字节（含重试）天然去重、互不覆盖。
+- 清单逐个列出 item 及其独立哈希，入库前逐项校验，损坏可定位到具体条目；gzip 还要解压后比对其内容寻址摘要。
+- `batch_id = sha256(规范化清单)`，是批次内容的纯函数。**`batch_seq` 仅作排序提示，不参与哈希**——这样中断后重新暂存同一批数据得到相同 id，批次台账本身就是幂等键，重试无需额外协商、也不会产生重复事件行。
+
+选择内容寻址而非"序号 + 整包校验"的理由：序号是易失的协商状态，中断重连、双机角色互换都会让序号漂移；而内容哈希自证身份，对端不需要相信源端的任何计数器，仅凭字节即可验证"这是不是同一批、有没有被截断或篡改"。两级哈希（清单整体 + 每 item）则兼顾防张冠李戴与可定位损坏。
+
+**批次是原子落地单位**：对端先在暂存区校验全部 item 哈希、快照内容哈希、事件→快照与 outbox→事件的引用完整性、以及版本/事件/outbox 的连续性，再在**单个 SQLite 事务 + 一次原子 outbox 重写**内入库。任一校验或写入失败，整批回退并标记 `failed`，从机制上杜绝"对端有事件却缺对应快照"的悬空引用。
+
+### 水位、续传与失败语义
+
+- 三条流各自维护**连续水位**：快照按监视项记最大连续 `version`；事件记全局连续 `events.id`；outbox 以完整 JSONL 行数为水位。水位只在批次持久化成功后推进。
+- 源端按对端当前水位只补齐缺失片段；对端存在洞时，只接受从最近连续水位的无缺口前缀，拒绝跨洞插入并给出明确 `gap` 失败，而不是整库重拷。
+- 中断（进程被杀、磁盘写满、网络/挂载断开）后，已暂存批次保留在 spool；重试从最近连续水位继续。写入失败有 `failed` 标记与 `.error` 侧车，重新 `push` 会用相同 batch_id 干净重暂存，`pull`/`push` 重复应用同一批次为空操作（显式主键 + 存在性检查）。
+- 落盘前做可用空间预检，磁盘不足直接报可重试错误而非半截写入。
+- spool 上有一把 `flock` 互斥锁，并发的第二个同步进程快速失败并提示，避免交错写。
+- push 的源端读取在 WAL 单一读事务快照上完成；同步进行中本机又跑完一轮监测时，新提交的快照/事件归入**下一批次**，水位推进既不丢也不重。
+
+### 兼容性
+
+同步只**新增**两张表 `sync_watermarks`、`sync_batches`（及 `meta` 中的 `sync_schema_version`），不修改任何既有表结构。旧库没有这两张表时，首次 `push`/`pull` 幂等补建；快照水位从现有最大版本号、事件水位从现有最大 id、outbox 从现有行数起算，因此不会把历史全量重发。所有旧命令（`run-once`、`digest`、`compact`、`serve-status` 等）行为不变。
+
+spool 目录布局：
+
+```
+<spool>/
+  locks/replication.lock      # 跨进程互斥
+  batches/<batch_id>/         # 暂存中：manifest.json + blobs/<sha256>
+  applied/<batch_id>.json     # 成功落地后的清单留痕
+  failed/<batch_id>.json+.error  # 失败批次与原因，供重试与排查
+```
+
 ## 本地模拟站点与剧本
 
 站点仅监听 `127.0.0.1`，支持 ETag/Last-Modified 和只读控制端点。页面：公告、文档、价格表、带计数器/时间戳噪声的状态页。剧本由固定种子驱动，不使用墙钟。
@@ -214,11 +258,12 @@ outbox 每行示例（虚构）：
 
 ## 测试与验收
 
-- `pytest -q`：64 个测试，全绿；不依赖网络和真实时间。
+- `pytest -q`：80 个测试，全绿；不依赖网络和真实时间。
 - `tests/conftest.py` 中的 socket 守卫 monkeypatch `connect` / `connect_ex`，会话结束断言无任何非本机连接尝试。
 - 时钟通过 `FrozenClock` 注入；数据目录均使用 `tmp_path` 隔离。
-- 核心模块（normalize / diff / classify / retention）单文件行覆盖率均 ≥85%；全项目约 85%。
+- 核心模块（normalize / diff / classify / retention / sync）单文件行覆盖率均 ≥85%；全项目约 85%。
 - 示例：`python -m pagewatch.demo` 在断网环境产出 `data/out/digest.html`；`compact --dry-run` 与正式执行使用同一计划函数。
+- 同步验收：`python3 scripts/acceptance_sync.py` 全程离线走查多轮快照/事件 → 中断续传 → 两端逐项比对（版本链、事件条数与 id、outbox 行、gzip 哈希）→ 传输窗口内插入新监测轮验证水位与去重 → 缺水位表老库自动补建且旧命令可用。`tests/test_sync.py` 另含批次篡改、blob 损坏、悬空引用、版本缺口、磁盘写满回退与并发锁等用例。
 
 ## 已知限制与明确不实现
 
