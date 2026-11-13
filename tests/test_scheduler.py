@@ -65,3 +65,17 @@ def test_execute_round_honors_worker_cap_and_order():
     assert execute_round(items, execute, max_workers=2) == ["a", "b", "c", "d"]
     assert active["max"] <= 2
     assert execute_round([], execute, 2) == []
+
+
+def test_demo_round_routes_through_enabled_aware_selection():
+    """The offline demo must not hand raw watches straight to execute_round,
+    otherwise disabled watches would be scheduled and produce artifacts."""
+    import inspect
+
+    from pagewatch import demo
+
+    source = inspect.getsource(demo)
+    assert "select_watches" in source
+    # No direct execute_round(<raw watches>, ...) call bypassing selection.
+    assert "execute_round(watches," not in source
+    assert "execute_round(due," in source

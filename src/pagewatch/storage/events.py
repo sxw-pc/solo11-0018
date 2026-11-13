@@ -101,12 +101,18 @@ def count_events(connection: sqlite3.Connection) -> dict[str, int]:
 def insert_alert(connection: sqlite3.Connection, *, watch_name: str,
                  severity: str, event_id: int, created_at: float,
                  message: str, cooldown_seconds: int) -> AlertRecord | None:
-    """Insert an alert unless the same watch/severity is cooling down."""
+    """Insert an alert unless the same watch/severity is cooling down.
+
+    Cooldown is keyed exactly on (watch_name, severity).  A prior alert
+    suppresses a new one only while ``created_at < prior + cooldown_seconds``;
+    at the exact expiry instant the window is over, so a recurring change
+    recovers instead of being silenced by a rolling window.
+    """
     dedup_key = f"{watch_name}:{severity}"
     if cooldown_seconds > 0:
         row = connection.execute(
             "SELECT id FROM alerts WHERE watch_name=? AND severity=? "
-            "AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
+            "AND created_at > ? ORDER BY created_at DESC LIMIT 1",
             (watch_name, severity, created_at - cooldown_seconds),
         ).fetchone()
         if row is not None:
