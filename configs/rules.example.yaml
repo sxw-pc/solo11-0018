@@ -24,6 +24,9 @@ retention:
   major_keep_forever: true
   # Unreferenced gzip archives may be deleted after this many days.
   archive_max_age_days: 30
+  # Consecutive failed quality-verification rounds before a quarantined
+  # watch is force-rebaselined (stops broken chains accumulating dirty data).
+  quarantine_rebaseline_limit: 3
 
 schedule:
   max_workers: 4

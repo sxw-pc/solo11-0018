@@ -21,6 +21,8 @@ from .models import Rules, WatchSpec
 from .normalize.pipeline import (
     blocks_from_json, blocks_to_json, normalize_html,
 )
+from .quality.models import WATCH_QUARANTINED, WATCH_REBASELINED
+from .quality.store import get_watch_quality_state, upsert_watch_quality_state
 from .schedule.backoff import next_due_at
 from .storage.db import connect, transaction
 from .storage.events import add_audit, insert_alert, insert_event
@@ -40,6 +42,8 @@ class WatchRunResult:
     alert_id: int | None = None
     snapshot_id: int | None = None
     error: str | None = None
+    quarantined: bool = False
+    rebaselined: bool = False
 
 
 class Runner:
@@ -66,6 +70,7 @@ class Runner:
             upsert_watch(connection, watch)
             connection.commit()
             state = get_watch_state(connection, watch.name) or {}
+            quality_state = get_watch_quality_state(connection, watch.name)
             try:
                 result = self.client_factory(rules).fetch(
                     watch.url, etag=state.get("etag"),
@@ -88,14 +93,18 @@ class Runner:
                 self._schedule(connection, watch, checked_at, success=True,
                                outcome="not_modified")
                 connection.commit()
-                return WatchRunResult(watch.name, "not_modified")
+                return WatchRunResult(
+                    watch.name, "not_modified",
+                    quarantined=quality_state is not None
+                    and quality_state.status == WATCH_QUARANTINED)
             record_fetch_state(
                 connection, name=watch.name, at=checked_at,
                 status_code=result.status_code, success=True,
                 etag=result.etag, last_modified=result.last_modified,
             )
             try:
-                return self._process(connection, watch, rules, result, checked_at)
+                return self._process(connection, watch, rules, result,
+                                     checked_at, quality_state)
             except Exception as exc:  # keep one bad page from aborting a round
                 add_audit(connection, at=checked_at, kind="processing.error",
                           watch_name=watch.name,
@@ -112,7 +121,8 @@ class Runner:
         return digest
 
     def _process(self, connection, watch: WatchSpec, rules: Rules,
-                 result: FetchResult, checked_at: float) -> WatchRunResult:
+                 result: FetchResult, checked_at: float,
+                 quality_state=None) -> WatchRunResult:
         page = normalize_html(
             result.text,
             include_selectors=watch.include_selectors,
@@ -131,6 +141,8 @@ class Runner:
                 normalized_text=page.text, blocks_json=blocks_to_json(page.blocks),
                 normalizer_version=page.normalizer_version,
             )
+            self._clear_rebaseline_anchor(connection, watch.name, checked_at,
+                                          quality_state)
             self._schedule(connection, watch, checked_at, success=True,
                            outcome="first")
             connection.commit()
@@ -139,8 +151,118 @@ class Runner:
             self._schedule(connection, watch, checked_at, success=True,
                            outcome="unchanged")
             connection.commit()
-            return WatchRunResult(watch.name, "unchanged",
-                                  snapshot_id=previous.id)
+            return WatchRunResult(
+                watch.name, "unchanged", snapshot_id=previous.id,
+                quarantined=quality_state is not None
+                and quality_state.status == WATCH_QUARANTINED)
+
+        rebaseline = (quality_state is not None
+                      and quality_state.status == WATCH_REBASELINED)
+        quarantined = (quality_state is not None
+                       and quality_state.status == WATCH_QUARANTINED)
+
+        if rebaseline:
+            return self._rebaseline(
+                connection, watch, rules, result, checked_at, page, previous,
+                raw_hash, quality_state)
+        if quarantined:
+            return self._quarantined_change(
+                connection, watch, rules, result, checked_at, page, previous,
+                raw_hash, quality_state)
+        return self._normal_change(
+            connection, watch, rules, result, checked_at, page, previous,
+            raw_hash)
+
+    def _rebaseline(self, connection, watch: WatchSpec, rules: Rules,
+                    result: FetchResult, checked_at: float, page,
+                    previous, raw_hash, quality_state) -> WatchRunResult:
+        """Force a new chain anchor after repeated structural failures.
+
+        The current content is archived as a fresh snapshot but no event or
+        alert is derived from the broken chain.  The quality state moves back
+        to a normal quarantine anchor pointing at the new version so future
+        checks only inspect the healthy tail of the chain.
+        """
+        with transaction(connection):
+            snapshot = append_snapshot(
+                connection, watch_name=watch.name, fetched_at=checked_at,
+                status_code=result.status_code, url=watch.url, etag=result.etag,
+                last_modified=result.last_modified,
+                content_sha256=page.content_hash, raw_sha256=raw_hash,
+                normalized_text=page.text, blocks_json=blocks_to_json(page.blocks),
+                normalizer_version=page.normalizer_version,
+            )
+            add_audit(
+                connection, at=checked_at, kind="quality.rebaseline",
+                watch_name=watch.name,
+                message=("forced rebaseline after "
+                         f"{quality_state.consecutive_failures} consecutive "
+                         "failed verification rounds"),
+                details={"previous_snapshot_id": previous.id,
+                         "new_snapshot_id": snapshot.id,
+                         "first_failed_round_id":
+                             quality_state.first_failed_round_id},
+            )
+            upsert_watch_quality_state(
+                connection, watch_name=watch.name, status=WATCH_QUARANTINED,
+                consecutive_failures=0,
+                rebaseline_version=snapshot.version,
+                first_failed_round_id=None,
+                last_report_round_id=quality_state.last_report_round_id,
+                updated_at=checked_at,
+            )
+            self._schedule(connection, watch, checked_at, success=True,
+                           outcome="rebaseline")
+        return WatchRunResult(watch.name, "rebaseline",
+                              snapshot_id=snapshot.id, quarantined=True,
+                              rebaselined=True)
+
+    def _quarantined_change(self, connection, watch: WatchSpec, rules: Rules,
+                            result: FetchResult, checked_at: float, page,
+                            previous, raw_hash,
+                            quality_state) -> WatchRunResult:
+        """Keep archiving a quarantined watch but skip graded alerting."""
+        old_blocks = blocks_from_json(previous.blocks_json)
+        changes = diff_blocks(old_blocks, page.blocks)
+        metrics = compute_metrics(old_blocks, page.blocks, changes,
+                                  watch.keywords)
+        severity = classify(metrics, rules)
+        with transaction(connection):
+            snapshot = append_snapshot(
+                connection, watch_name=watch.name, fetched_at=checked_at,
+                status_code=result.status_code, url=watch.url, etag=result.etag,
+                last_modified=result.last_modified,
+                content_sha256=page.content_hash, raw_sha256=raw_hash,
+                normalized_text=page.text, blocks_json=blocks_to_json(page.blocks),
+                normalizer_version=page.normalizer_version,
+            )
+            insert_event(
+                connection, watch_name=watch.name,
+                from_snapshot_id=previous.id, to_snapshot_id=snapshot.id,
+                created_at=checked_at, severity=severity,
+                change_rate=metrics.change_rate,
+                added_lines=metrics.added_lines, removed_lines=metrics.removed_lines,
+                regions=metrics.regions, keyword_hits=metrics.keyword_hits,
+                focus_hit=metrics.focus_hit,
+                summary=f"quarantined: {self._summary(severity, metrics, rules)}",
+                diff_text=unified_diff(previous.normalized_text, page.text,
+                                       rules.diff_max_chars),
+            )
+            add_audit(
+                connection, at=checked_at, kind="quality.quarantined_run",
+                watch_name=watch.name,
+                message=("watch under quarantine: change archived without "
+                         "graded alerting"),
+                details={"snapshot_id": snapshot.id, "severity": severity},
+            )
+            self._schedule(connection, watch, checked_at, success=True,
+                           outcome=f"quarantined:{severity}")
+        return WatchRunResult(watch.name, "quarantined", severity=severity,
+                              snapshot_id=snapshot.id, quarantined=True)
+
+    def _normal_change(self, connection, watch: WatchSpec, rules: Rules,
+                       result: FetchResult, checked_at: float, page,
+                       previous, raw_hash) -> WatchRunResult:
         old_blocks = blocks_from_json(previous.blocks_json)
         changes = diff_blocks(old_blocks, page.blocks)
         metrics = compute_metrics(old_blocks, page.blocks, changes, watch.keywords)
@@ -189,6 +311,25 @@ class Runner:
         return WatchRunResult(
             watch.name, "changed", severity=severity, event_id=event.id,
             alert_id=alert.id if alert else None, snapshot_id=snapshot.id,
+        )
+
+    @staticmethod
+    def _clear_rebaseline_anchor(connection, watch_name: str, now: float,
+                                 quality_state) -> None:
+        """Drop a stale rebaseline anchor when a fresh baseline is written.
+
+        The watch's lifecycle status is owned by the next verification round;
+        here we only stop chain checks from being scoped to an old anchor.
+        """
+        if quality_state is None or quality_state.rebaseline_version is None:
+            return
+        upsert_watch_quality_state(
+            connection, watch_name=watch_name, status=quality_state.status,
+            consecutive_failures=quality_state.consecutive_failures,
+            rebaseline_version=None,
+            first_failed_round_id=quality_state.first_failed_round_id,
+            last_report_round_id=quality_state.last_report_round_id,
+            updated_at=now,
         )
 
     @staticmethod

@@ -18,6 +18,7 @@ from .alert.outbox import read_outbox
 from .clock import FrozenClock, utc_iso
 from .config import load_all
 from .models import DataPaths
+from .quality.round import verify_round
 from .report.digest import write_digest
 from .runner import Runner
 from .schedule.scheduler import execute_round
@@ -141,7 +142,17 @@ def run_demo(root: str | Path = "data") -> int:
                 + (f"/{result.severity}" if result.severity else "")
                 for result in results
             )
+            verification = verify_round(
+                db_path=paths.db_path, outbox_path=paths.outbox_path,
+                rules=rules,
+                watch_names=tuple(watch.name for watch in watches),
+                checked_at=clock.now())
+            report = verification.report
             print(f"step {step} [{STEP_LABELS[step]}]: {rendered}")
+            print(f"         quality {report.round_id}: {report.status} "
+                  f"({len(report.findings)} finding(s), "
+                  f"{len(report.quarantined)} quarantined, "
+                  f"hash {report.content_hash[:12]})")
 
         with connect(paths.db_path) as connection:
             events = list_events(connection, since=start, until=clock.now())

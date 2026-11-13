@@ -219,7 +219,8 @@ def _rules_from_data(data: dict[str, Any], path: Path) -> Rules:
                            "focus_selectors"},
         "alerts": {"severities", "cooldown_seconds"},
         "diff": {"max_chars"},
-        "retention": {"keep_last", "major_keep_forever", "archive_max_age_days"},
+        "retention": {"keep_last", "major_keep_forever", "archive_max_age_days",
+                      "quarantine_rebaseline_limit"},
         "schedule": {"max_workers", "jitter_seconds"},
         "fetch": {"timeout_seconds", "max_bytes"},
     }
@@ -259,6 +260,10 @@ def _rules_from_data(data: dict[str, Any], path: Path) -> Rules:
         archive_max_age_days=_int(
             retention.get("archive_max_age_days"), path,
             "retention.archive_max_age_days", "archive_max_age_days", 0, 30),
+        quarantine_rebaseline_limit=_int(
+            retention.get("quarantine_rebaseline_limit", 3), path,
+            "retention.quarantine_rebaseline_limit",
+            "quarantine_rebaseline_limit", 1),
         max_workers=_int(schedule.get("max_workers"), path, "schedule.max_workers",
                          "max_workers", 1, 4),
         jitter_seconds=_int(schedule.get("jitter_seconds"), path,

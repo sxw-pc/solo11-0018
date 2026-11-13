@@ -10,7 +10,7 @@ from typing import Any, Iterator
 
 from ..models import DataPaths
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -110,6 +110,28 @@ CREATE TABLE IF NOT EXISTS stats (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quality_reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id TEXT NOT NULL UNIQUE,
+    checked_at REAL NOT NULL,
+    status TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    watch_names_json TEXT NOT NULL,
+    checks_json TEXT NOT NULL,
+    findings_json TEXT NOT NULL,
+    quarantined_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quality_reports_time
+    ON quality_reports(checked_at);
+CREATE TABLE IF NOT EXISTS quality_watch_states (
+    watch_name TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    rebaseline_version INTEGER,
+    first_failed_round_id TEXT,
+    last_report_round_id TEXT,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -133,6 +155,36 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     connection.execute("PRAGMA busy_timeout=15000")
     connection.execute("PRAGMA foreign_keys=ON")
     return connection
+
+
+def connect_read_only(db_path: str | Path) -> sqlite3.Connection:
+    """Open a strictly read-only connection.
+
+    Quality verification must never mutate the database.  The URI mode plus
+    ``query_only`` blocks writes at two layers; a missing file raises instead
+    of being created.
+    """
+    path = Path(db_path)
+    uri = f"file:{path.as_posix()}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=15,
+                                 factory=_ClosingConnection)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    connection.execute("PRAGMA busy_timeout=15000")
+    return connection
+
+
+def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(
+        f"PRAGMA table_info({table})").fetchall()}
+
+
+def table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
 
 
 @contextmanager

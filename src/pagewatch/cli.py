@@ -13,6 +13,7 @@ from .clock import Clock, SystemClock, parse_iso, utc_iso
 from .config import ConfigError, load_all, load_rules
 from .fetch.allowlist import is_host_allowed
 from .models import DataPaths
+from .quality.round import verify_round
 from .retention.compact import compact
 from .retention.policy import format_plan
 from .runner import Runner
@@ -71,6 +72,16 @@ def _parser() -> argparse.ArgumentParser:
     compact_cmd.add_argument("--dry-run", action="store_true")
     compact_cmd.set_defaults(func=_cmd_compact)
 
+    verify = sub.add_parser(
+        "verify", help="run the read-only round verification again")
+    verify.add_argument("--config", default=DEFAULT_WATCHLIST)
+    verify.add_argument("--rules", default=DEFAULT_RULES)
+    verify.add_argument("--data-dir", default="data")
+    verify.add_argument("--name", action="append", default=[])
+    verify.add_argument("--json", action="store_true",
+                        help="print the full report as JSON")
+    verify.set_defaults(func=_cmd_verify)
+
     status = sub.add_parser("serve-status", help="serve read-only status on localhost")
     status.add_argument("--data-dir", default="data")
     status.add_argument("--host", default="127.0.0.1")
@@ -104,17 +115,38 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
                               due_only=args.due_only, states=states, now=now)
     runner = Runner(db_path=paths.db_path, archive_dir=paths.archive_dir,
                     outbox_path=paths.outbox_path, rules=rules, clock=clock)
+    # execute_round joins every worker before returning, so all snapshot,
+    # event and alert transactions are committed when verification starts.
     results = execute_round(selected, runner.run, rules.max_workers)
+    verification = None
+    if selected:
+        verification = verify_round(
+            db_path=paths.db_path, outbox_path=paths.outbox_path, rules=rules,
+            watch_names=tuple(watch.name for watch in selected),
+            checked_at=clock.now())
     payload = [asdict(result) for result in results]
     if args.json:
-        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        output = {"results": payload}
+        if verification is not None:
+            output["quality"] = verification.report.as_dict()
+        print(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True))
     else:
         for result in results:
             suffix = f" severity={result.severity}" if result.severity else ""
             error = f" error={result.error}" if result.error else ""
-            print(f"{result.watch_name}: {result.outcome}{suffix}{error}")
+            quarantine = " [quarantined]" if result.quarantined else ""
+            print(f"{result.watch_name}: {result.outcome}{suffix}{error}"
+                  f"{quarantine}")
         if not results:
             print("no watches selected")
+        if verification is not None:
+            report = verification.report
+            print(f"quality: round={report.round_id} status={report.status} "
+                  f"findings={len(report.findings)} "
+                  f"quarantined={len(report.quarantined)} "
+                  f"hash={report.content_hash[:12]}")
+    # A failed verification never fails the whole round: data is already
+    # archived content-addressed and the damaged watches are quarantined.
     return 1 if any(result.outcome == "error" for result in results) else 0
 
 
@@ -156,6 +188,42 @@ def _cmd_compact(args: argparse.Namespace) -> int:
     if result.executed:
         print(f"removed {result.removed_snapshots} snapshot(s), "
               f"{result.removed_archives} archive(s), {result.removed_bytes} bytes")
+    return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    watches, rules = load_all(args.config, args.rules)
+    paths = DataPaths(Path(args.data_dir))
+    if not paths.db_path.exists():
+        raise FileNotFoundError(f"database not found: {paths.db_path}")
+    clock = build_clock()
+    if args.name:
+        chosen = {watch.name for watch in watches if watch.name in set(args.name)}
+        unknown = set(args.name) - chosen
+        if unknown:
+            raise ValueError(f"unknown watch name(s): {', '.join(sorted(unknown))}")
+        names = tuple(sorted(chosen))
+    else:
+        names = tuple(watch.name for watch in watches)
+    verification = verify_round(
+        db_path=paths.db_path, outbox_path=paths.outbox_path, rules=rules,
+        watch_names=names, checked_at=clock.now())
+    report = verification.report
+    if args.json:
+        print(json.dumps(report.as_dict(), ensure_ascii=False, indent=2,
+                         sort_keys=True))
+    else:
+        print(f"quality: round={report.round_id} status={report.status} "
+              f"hash={report.content_hash}")
+        for check in report.checks:
+            print(f"  [{check.status}] {check.check}: "
+                  f"{check.failure_count} failure(s), "
+                  f"{check.unknown_count} unknown(s)")
+            for finding in check.findings:
+                print(f"    - {finding.severity} {finding.code}: "
+                      f"{finding.message}")
+        if report.quarantined:
+            print("quarantined watches: " + ", ".join(report.quarantined))
     return 0
 
 

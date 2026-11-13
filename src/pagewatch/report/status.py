@@ -9,7 +9,7 @@ from flask import Flask, Response
 
 from ..clock import SystemClock, utc_iso
 from ..fetch.allowlist import is_host_allowed
-from ..storage.db import connect
+from ..storage.db import connect, table_exists
 from .render import esc, html_document, severity_badge
 
 STATUS_SQL = """
@@ -25,22 +25,53 @@ FROM watches w LEFT JOIN schedule_state s ON s.watch_name=w.name
 ORDER BY w.name
 """
 
+QUALITY_SQL = """
+SELECT watch_name, status, consecutive_failures, rebaseline_version
+FROM quality_watch_states
+"""
+
 
 def status_rows(db_path: str | Path) -> list[sqlite3.Row]:
     with connect(db_path) as connection:
-        return connection.execute(STATUS_SQL).fetchall()
+        rows = connection.execute(STATUS_SQL).fetchall()
+        if table_exists(connection, "quality_watch_states"):
+            quality = {
+                row["watch_name"]: row
+                for row in connection.execute(QUALITY_SQL).fetchall()
+            }
+        else:
+            quality = {}
+    return [_merge_quality(row, quality.get(row["name"])) for row in rows]
 
 
-def _row_html(row: sqlite3.Row) -> str:
+def _merge_quality(row: sqlite3.Row, quality: sqlite3.Row | None) -> dict:
+    value = dict(row)
+    value["quality_status"] = quality["status"] if quality else None
+    value["quality_failures"] = (quality["consecutive_failures"]
+                                 if quality else 0)
+    value["rebaseline_version"] = (quality["rebaseline_version"]
+                                   if quality else None)
+    return value
+
+
+def _row_html(row: dict) -> str:
     severity = row["latest_severity"] or "none"
     badge = severity_badge(severity) if severity != "none" else '<span class="meta">none</span>'
     last_checked = utc_iso(row["last_checked_at"]) if row["last_checked_at"] else "-"
     next_due = utc_iso(row["next_due_at"]) if row["next_due_at"] else "-"
     error = f'<div class="stats"><span>error: {esc(row["last_error"])}</span></div>' \
         if row["last_error"] else ""
+    quality_status = row.get("quality_status")
+    if quality_status in ("quarantined", "rebaselined"):
+        quality = (
+            f'<span class="badge" style="background:#7c2d12;color:#fff">'
+            f'quality: {esc(quality_status)} '
+            f'({int(row.get("quality_failures") or 0)} failed round(s))</span>')
+    else:
+        quality = '<span class="meta">quality: ok</span>'
     return f"""
 <article class="event">
-  <h3>{esc(row["name"])} {badge}</h3>
+  <h3>{esc(row["name"])} {badge} {quality}</h3>
   <div class="meta">{esc(row["url"])}</div>
   <div class="stats">
     <span>latest version {row["latest_version"] or "-"}</span>

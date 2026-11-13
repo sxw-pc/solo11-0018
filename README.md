@@ -126,6 +126,7 @@ watches:
 | `retention.keep_last` | `5` | 每个监视项至少保留的最新快照数 |
 | `retention.major_keep_forever` | `true` | major 事件目标快照永久保留 |
 | `retention.archive_max_age_days` | `30` | 未被引用旧 gzip 的最短保留天数 |
+| `retention.quarantine_rebaseline_limit` | `3` | 监视项连续多少轮质量校验失败后强制 rebaseline（1–100） |
 | `schedule.max_workers` | `4` | 单轮全局并发上限 |
 | `schedule.jitter_seconds` | `10` | 按监视项名称确定性错峰的上限 |
 | `fetch.timeout_seconds` | `5` | 连接/读取超时 |
@@ -154,6 +155,10 @@ pagewatch digest --data-dir data --output data/out/digest.html \
 # 清理：dry-run 只打印对象与释放空间；执行后更新统计台账，可重复执行
 pagewatch compact --data-dir data --dry-run
 pagewatch compact --data-dir data
+
+# 轮次级质量校验：只读复跑一轮五项结构检查并持久化报告
+pagewatch verify --data-dir data
+pagewatch verify --data-dir data --name docs --json
 
 # 只读状态页，只允许绑定 127.0.0.1
 pagewatch serve-status --data-dir data --port 8766
@@ -184,7 +189,9 @@ SQLite 表概览：
 | `events` | 变更事件：分级、变更率、增删行、区域、关键词、截断 diff |
 | `alerts` | 告警台账，`(watch, severity, created_at)` 用于冷却去重 |
 | `schedule_state` | 持久化 `next_due_at`、连续失败数、最近结果 |
-| `audit_log` | 白名单拒绝、抓取错误、compact 等审计事件 |
+| `quality_reports` | 每轮质量校验报告：五项检查结论、findings、可复现 content_hash |
+| `quality_watch_states` | 每监视项隔离状态、连续断裂轮数、rebaseline 锚点版本 |
+| `audit_log` | 白名单拒绝、抓取错误、compact、质量校验、隔离与 rebaseline 等审计事件 |
 | `meta` / `stats` | schema 版本与累计统计 |
 
 - **条件请求**：携带 `If-None-Match` / `If-Modified-Since`；304 不创建快照，只记录 probe 并推进调度。
@@ -193,6 +200,7 @@ SQLite 表概览：
 - **调度**：每项独立周期 + 基于名称哈希的确定性错峰；失败按 `interval × 2^failures` 指数退避且封顶 1 小时；恢复成功立即归零。下次时间从“当前时刻”计算，错过超过一轮不补跑。
 - **告警**：命中 `alert.severities` 后先写 SQLite，再追加 JSONL；冷却期内同监视项同级重复告警被去重。
 - **保留**：`compact` 按监视项保留最新 N 版，major 目标版本豁免；未被任何保留快照引用的旧 gzip 超期后删除。执行幂等并累计统计。
+- **轮次质量保障**：每轮所有 worker 落盘并 join 后，用独立的只读连接（`mode=ro` + `query_only`）执行五项确定性检查——快照版本链连续性、事件端点快照引用、告警台账与事件双向配对、outbox JSONL 与台账配对、major 事件目标快照在压缩后是否仍在。检查不采样、不随机，报告内容哈希只覆盖结论（不含轮次号与时间戳），同一数据重复校验哈希一致。校验失败不回滚整轮：快照与 gzip 是内容寻址留档，回滚代价高；失败的监视项写入 `quality_watch_states` 标记为 `quarantined`，下一轮继续抓取留档但跳过常规分级告警。连续断裂达到 `retention.quarantine_rebaseline_limit`（默认 3）后强制 rebaseline，以当前内容建立新链锚点，锚点之前的历史损伤不再计入检查，从而避免脏数据无限累积。老库缺表/缺列时对应检查降级为 `unknown` 而非报错。
 
 outbox 每行示例（虚构）：
 

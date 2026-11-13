@@ -36,6 +36,9 @@ class Rules:
     jitter_seconds: int = 10
     timeout_seconds: float = 5.0
     max_bytes: int = 2_097_152
+    # Round-level quality gate: number of consecutive quarantined rounds before
+    # a watch is force-rebaselined so structural damage cannot accumulate forever.
+    quarantine_rebaseline_limit: int = 3
 
 
 @dataclass(frozen=True)
