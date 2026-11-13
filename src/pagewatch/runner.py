@@ -10,9 +10,10 @@ from .alert.outbox import append_alert
 from .alert.rules import alert_message, should_alert
 from .clock import Clock, SystemClock
 from .config import effective_rules
+from .diff.alignment import AnchorAlignmentError, anchor_diff_blocks
 from .diff.blockdiff import diff_blocks
 from .diff.classify import classify, reasons
-from .diff.metrics import compute_metrics
+from .diff.metrics import compute_legacy_metrics, compute_metrics
 from .diff.textdiff import unified_diff
 from .fetch.allowlist import AllowlistError
 from .fetch.archive import write_archive
@@ -142,8 +143,9 @@ class Runner:
             return WatchRunResult(watch.name, "unchanged",
                                   snapshot_id=previous.id)
         old_blocks = blocks_from_json(previous.blocks_json)
-        changes = diff_blocks(old_blocks, page.blocks)
-        metrics = compute_metrics(old_blocks, page.blocks, changes, watch.keywords)
+        changes, metrics = self._align_and_measure(
+            connection, watch, checked_at, old_blocks, page.blocks,
+        )
         severity = classify(metrics, rules)
         summary = self._summary(severity, metrics, rules)
         diff_text = unified_diff(previous.normalized_text, page.text,
@@ -190,6 +192,32 @@ class Runner:
             watch.name, "changed", severity=severity, event_id=event.id,
             alert_id=alert.id if alert else None, snapshot_id=snapshot.id,
         )
+
+    def _align_and_measure(self, connection, watch: WatchSpec, checked_at: float,
+                           old_blocks, new_blocks):
+        """Anchor-aligned block diff with a line-level degradation path.
+
+        Any anchor computation/alignment failure (or an invariant violation)
+        degrades this watch round to the original whole-text line diff and
+        leaves an ``anchor.alignment_fallback`` audit record so the condition
+        is diagnosable; the monitoring round never crashes on it.
+        """
+        try:
+            changes = anchor_diff_blocks(old_blocks, new_blocks)
+            metrics = compute_metrics(old_blocks, new_blocks, changes,
+                                      watch.keywords)
+            return changes, metrics
+        except AnchorAlignmentError as exc:
+            add_audit(
+                connection, at=checked_at, kind="anchor.alignment_fallback",
+                watch_name=watch.name, message=str(exc),
+                details={"old_blocks": len(old_blocks),
+                         "new_blocks": len(new_blocks)},
+            )
+            changes = diff_blocks(old_blocks, new_blocks)
+            metrics = compute_legacy_metrics(old_blocks, new_blocks, changes,
+                                             watch.keywords)
+            return changes, metrics
 
     @staticmethod
     def _summary(severity: str, metrics, rules: Rules) -> str:

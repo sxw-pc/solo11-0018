@@ -76,6 +76,10 @@ def create_app(state: ScenarioState | None = None) -> Flask:
     def noisy() -> Response:
         return conditional("noisy", "noisy.html")
 
+    @app.get("/listings")
+    def listings() -> Response:
+        return conditional("listings", "listings.html")
+
     @app.get("/healthz")
     def healthz() -> Response:
         return Response("ok\n", mimetype="text/plain; charset=utf-8")

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}列表{% endblock %}
+{% block content %}
+<main id="listing-body">
+  <h1>示例列表页</h1>
+  {% if banner %}
+  <p class="dynamic noise">{{ banner }}</p>
+  {% endif %}
+  {% for section in sections %}
+  <section id="{{ section.id }}">
+    <h2>{{ section.id }}</h2>
+    {% for item in section.entries %}
+    <p>{{ item }}</p>
+    {% endfor %}
+    {% if repeated %}
+    <p class="repeated">{{ repeated }}</p>
+    {% endif %}
+  </section>
+  {% endfor %}
+  <footer id="listing-footer">
+    <p>{{ footer }}</p>
+  </footer>
+</main>
+{% endblock %}

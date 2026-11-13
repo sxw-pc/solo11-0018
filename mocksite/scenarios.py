@@ -19,8 +19,10 @@ PAGE_PATHS = {
     "docs": "/docs",
     "pricing": "/pricing",
     "noisy": "/noisy",
+    "listings": "/listings",
 }
-PAGE_CHANGED_AT = {"announcements": 3, "docs": 1, "pricing": 0, "noisy": 2}
+PAGE_CHANGED_AT = {"announcements": 3, "docs": 1, "pricing": 0, "noisy": 2,
+                   "listings": 1}
 
 DOC_PARAGRAPHS = [
     "欢迎阅读本地部署手册。本手册只使用示例域名和占位数据。",
@@ -48,6 +50,57 @@ PRICE_ROWS = (
     ("企业版", "899", "100 个页面"),
     ("本地版", "0", "仅本机"),
 )
+
+# Block-alignment scenario.  Every step is a pure function of ``step`` and the
+# chain exercises top insertion, whole-section translation, single-block
+# deletion and a full rewrite, with repeated blocks to stress anchor
+# disambiguation.  ``listing_banner`` is tagged with a noise class so its
+# insertion stays below the noise floor.
+LISTING_REPEATED = "占位条目，内容相同。"
+LISTING_SECTION_A = [
+    "列表单元 A-1：部署前先核对环境变量。",
+    "列表单元 A-2：备份策略每日凌晨执行一次。",
+    "列表单元 A-3：日志保留窗口为三十天。",
+]
+LISTING_SECTION_B = [
+    "列表单元 B-1：只读状态页仅监听本机回环地址。",
+    "列表单元 B-2：告警台账不向站外发送任何数据。",
+    "列表单元 B-3：压缩任务先出干跑计划再执行。",
+]
+LISTING_FOOTER = "列表页脚：以上均为演示数据。"
+LISTING_BANNER = "顶部横幅：本期新增的临时提示，关闭后自动消失。"
+
+
+def listing_context(step: int) -> dict[str, object]:
+    sections: list[dict[str, object]] = [
+        {"id": "section-a", "entries": list(LISTING_SECTION_A)},
+        {"id": "section-b", "entries": list(LISTING_SECTION_B)},
+    ]
+    if step == 1:
+        return {"banner": LISTING_BANNER, "sections": sections,
+                "repeated": LISTING_REPEATED, "footer": LISTING_FOOTER}
+    if step == 2:
+        # Pure section translation: section B moves above section A.
+        sections = [sections[1], sections[0]]
+        return {"banner": LISTING_BANNER, "sections": sections,
+                "repeated": LISTING_REPEATED, "footer": LISTING_FOOTER}
+    if step == 3:
+        # Single-block deletion after the translation settles.
+        sections = [
+            {"id": "section-b", "entries": list(LISTING_SECTION_B)},
+            {"id": "section-a", "entries": LISTING_SECTION_A[:2]},
+        ]
+        return {"banner": LISTING_BANNER, "sections": sections,
+                "repeated": LISTING_REPEATED, "footer": LISTING_FOOTER}
+    if step >= 4:
+        # Whole-page rewrite: no anchor survives.
+        return {"banner": None,
+                "sections": [{"id": "rewrite",
+                              "entries": [f"全新列表内容第 {n} 条，旧条目全部下线。"
+                                        for n in range(1, 9)]}],
+                "repeated": None, "footer": "改版后的新页脚，旧页脚已移除。"}
+    return {"banner": None, "sections": sections,
+            "repeated": LISTING_REPEATED, "footer": LISTING_FOOTER}
 
 
 @dataclass
@@ -89,10 +142,24 @@ def context_for(page: str, step: int, seed: int = SCENARIO_SEED) -> dict[str, ob
             "timestamp": "2026-01-01 00:00:00",
             "session": f"session-{seed % 997:03d}",
         }
+    if page == "listings":
+        return listing_context(step)
     raise KeyError(f"unknown mock page: {page}")
 
 
+# Per-step modification hours for pages whose content changes on more than
+# one step; otherwise Last-Modified would freeze after the first change and
+# conditional requests would answer later steps with 304.
+STEP_CHANGE_HOURS = {
+    "listings": {1: 1, 2: 2, 3: 3, 4: 4},
+}
+
+
 def last_modified_for(page: str, step: int) -> datetime:
+    if page in STEP_CHANGE_HOURS:
+        hours = [hour for at, hour in sorted(STEP_CHANGE_HOURS[page].items())
+                 if step >= at]
+        return BASE_LAST_MODIFIED.replace(hour=hours[-1] if hours else 0)
     changed_at = PAGE_CHANGED_AT[page]
     applied = changed_at if step >= changed_at else 0
     return BASE_LAST_MODIFIED.replace(hour=applied)

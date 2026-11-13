@@ -70,8 +70,8 @@ configs/                 watchlist 与 rules 示例
 src/pagewatch/           cli / config / models / runner / clock
   storage/               SQLite schema、快照链、事件与告警台账
   fetch/                 白名单、条件请求客户端、gzip 留档
-  normalize/             HTML 清理、选择器裁剪、噪声掩码
-  diff/                  行级 diff、块对齐、指标、分级
+  normalize/             HTML 清理、选择器裁剪、噪声掩码、无位置块锚点
+  diff/                  锚点块对齐（未配对块回退行级 diff）、指标、分级
   alert/                 告警资格规则、JSONL outbox
   schedule/              错峰、退避、并发上限
   report/                digest 渲染与只读状态页
@@ -131,7 +131,10 @@ watches:
 | `fetch.timeout_seconds` | `5` | 连接/读取超时 |
 | `fetch.max_bytes` | `2097152` | 响应体硬上限（2 MiB） |
 
-变更率定义为 `(新增行 + 删除行) / max(旧行数, 新行数, 1)`。分级优先级：
+变更率定义为锚点对齐后的 `(新增块 + 删除块) / max(旧块数, 新块数, 1)`；
+锚点只含块文本指纹与相邻块上下文、不含位置，纯插入/删除/平移不改变锚点身份，
+配对不上的块才回退行级比较，锚点计算异常时整项降级为原整篇行级 diff 并写 audit。
+分级优先级：
 `focus/keyword/high-rate → major`；否则 `noise-only 或低于噪声下界 → noise`；其余 `minor`。
 `check-config` 会校验缺字段、未知字段、URL/凭据/白名单、CSS/正则语法、间隔下界、重复名称和规则范围，错误信息带文件与条目定位。
 
