@@ -75,6 +75,7 @@ src/pagewatch/           cli / config / models / runner / clock
   alert/                 告警资格规则、JSONL outbox
   schedule/              错峰、退避、并发上限
   report/                digest 渲染与只读状态页
+  propagate/             变更传播归因（跨监视项关联、方向推断、归因图导出）
   retention/             保留策略与 compact
 mocksite/                确定性 Flask 模拟站点与剧本
 tests/                   单元、集成、离线守卫与 fixtures
@@ -151,6 +152,15 @@ pagewatch digest --data-dir data --output data/out/digest.html \
                  --json-out data/out/events.json \
                  --since 2026-01-01T00:00:00Z --until 2026-01-02T00:00:00Z
 
+# 变更传播归因：独立导出归因图（JSON + 可选 HTML）
+pagewatch attribute --data-dir data \
+                    --output data/out/attribution.json \
+                    --html data/out/attribution.html
+
+# 摘要内嵌归因结论：digest 增加传播归因小节，并同时导出独立 JSON
+pagewatch digest --data-dir data --with-attribution \
+                 --attribution-out data/out/attribution.json
+
 # 清理：dry-run 只打印对象与释放空间；执行后更新统计台账，可重复执行
 pagewatch compact --data-dir data --dry-run
 pagewatch compact --data-dir data
@@ -163,6 +173,34 @@ pagewatch demo
 ```
 
 `digest` 的 HTML/JSON 排序固定、无 JavaScript、无外部资源；`--generated-at` 可显式固定页眉时间，因此相同数据和参数生成逐字节一致的文件。
+
+## 变更传播归因（propagate）
+
+`pagewatch attribute` 是独立于 diff/classify 的只读分析层：同一站点里一个页面改动后，条款页、价目页往往跟着变。它把同一轮或相邻轮次里多个监视项的变更事件关联成一张**归因图**——哪个监视项是源头、哪些是下游、各自置信度多少。数据只来自三处已有存储：事件台账（`events`）、快照链（`snapshots`）和快照里的规范化块（`blocks_json`），不重新抓取、不改写任何表。
+
+**内容指纹**：每个事件从其 from/to 两个快照的规范化块中算出「新增块哈希集」与「删除块哈希集」（块哈希 = 规范化文本的 SHA-256，复用 normalize 管线）。噪声块（掩码后全站都是同一个 `[NOISE]` 文本）和短于 `min_block_chars`（默认 8 字符）的块不参与指纹，避免误关联。两个事件的指纹相交即形成链接，分三种：`added`（同段文本同步新增）、`removed`（同步删除）、`moved`（一处删除、另一处新增，即内容迁移）。
+
+**时间窗口与置信度衰减（归因口径）**：
+
+- **配对窗口 `--window-seconds`（默认 180s）**：只有两个事件自身携带的 `created_at` 相差不超过窗口才会被比较。默认 180s 覆盖「同一轮并发抓取的时间散布 + 相邻一轮」（对 ≤2 分钟的监测间隔）。窗口边界是闭区间。
+- **簇跨度上限 `--max-span-seconds`（默认 600s）**：仅靠两两窗口，链式关联（A~B、B~C、C~D…）会把簇无限拉长。任何连通簇的总跨度超过该上限时，在**最大时间间隙**处确定性切开（并列取最早间隙），被切掉的事件标记为 `beyond_max_span`。
+- **置信度**：`confidence = 内容包含度 × 时间衰减`。包含度 = 共享块数 ÷ 较小一侧变更块数；时间衰减从 1.0（同刻）线性降到窗口边缘的 0.5——内容重叠是主信号，时间距离最多把它减半。
+
+**方向推断**（源头 → 下游），信号按强度排序，依据会记录在 `direction_basis` 里：
+
+1. `timestamp`（权重 0.6~1.0，随时间差占窗口比例增大）：先发生变更的监视项是源头。**排序只用事件自带时间戳，绝不用入库顺序**——一轮监测是并发抓取的，事件 id 不代表真实先后。
+2. `path_prefix`（权重 0.25）：URL 路径互为前缀时，较浅的页面（如 `/portal` 之于 `/portal/terms`）更可能是源头。
+3. `name_order_fallback`（权重 0.1）：前两个信号都缺席时，按监视项名称字典序打破平局，仅为保证确定性，置信度极低。
+
+**降级契约**（不抛异常）：范围内零事件 → `no_events`；只有单个监视项 → `single_watch_scope`；这两种情况整体退化为无关联、结果级 `confidence` 为 `null`。个别事件的快照被保留策略清理 → 该事件进 `unattributed`（原因 `missing_snapshot`），其余事件照常关联，结果标记 `missing_snapshots`。
+
+**确定性**：全部排序键显式（`created_at, watch_name, event_id`），不读墙钟；`generated_at` 默认取数据内最大事件时间。同一批数据重复跑两次，JSON 逐字节一致。
+
+```bash
+pagewatch attribute --data-dir data --window-seconds 180 --max-span-seconds 600 \
+                    --output data/out/attribution.json --json
+```
+
 
 ## 数据布局与运行时机制
 

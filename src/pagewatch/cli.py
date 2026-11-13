@@ -63,7 +63,42 @@ def _parser() -> argparse.ArgumentParser:
     digest.add_argument("--json-out", default=None)
     digest.add_argument("--generated-at", default=None)
     digest.add_argument("--title", default="pagewatch change digest")
+    digest.add_argument("--with-attribution", action="store_true",
+                        help="embed a cross-watch propagation attribution "
+                             "section into the digest")
+    digest.add_argument("--attribution-out", default=None,
+                        help="also write the standalone attribution JSON "
+                             "export to this path (implies --with-attribution)")
+    digest.add_argument("--window-seconds", type=float, default=None,
+                        help="attribution pairing window (default: module "
+                             "default)")
+    digest.add_argument("--max-span-seconds", type=float, default=None,
+                        help="attribution cluster span cap (default: module "
+                             "default)")
+    digest.add_argument("--min-block-chars", type=int, default=None,
+                        help="minimum normalized-block length used for "
+                             "attribution fingerprints")
     digest.set_defaults(func=_cmd_digest)
+
+    attribute = sub.add_parser(
+        "attribute",
+        help="attribute cross-watch change propagation and export the graph")
+    attribute.add_argument("--data-dir", default="data")
+    attribute.add_argument("--since", default=None)
+    attribute.add_argument("--until", default=None)
+    attribute.add_argument("--window-seconds", type=float, default=None)
+    attribute.add_argument("--max-span-seconds", type=float, default=None)
+    attribute.add_argument("--min-block-chars", type=int, default=None)
+    attribute.add_argument("--output", default=None,
+                           help="attribution JSON path "
+                                "(default: <data-dir>/out/attribution.json)")
+    attribute.add_argument("--html", default=None,
+                           help="optional standalone attribution HTML report")
+    attribute.add_argument("--generated-at", default=None,
+                           help="fix the generated-at timestamp (ISO-8601)")
+    attribute.add_argument("--json", action="store_true",
+                           help="also print the attribution JSON to stdout")
+    attribute.set_defaults(func=_cmd_attribute)
 
     compact_cmd = sub.add_parser("compact", help="apply retention/cleanup policy")
     compact_cmd.add_argument("--rules", default=DEFAULT_RULES)
@@ -118,6 +153,22 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
     return 1 if any(result.outcome == "error" for result in results) else 0
 
 
+def _attribution_kwargs(args: argparse.Namespace) -> dict[str, object]:
+    from . import propagate
+
+    def pick(value: object, default: object) -> object:
+        return default if value is None else value
+
+    return {
+        "window_seconds": pick(args.window_seconds,
+                               propagate.DEFAULT_WINDOW_SECONDS),
+        "max_span_seconds": pick(args.max_span_seconds,
+                                 propagate.DEFAULT_MAX_SPAN_SECONDS),
+        "min_block_chars": pick(args.min_block_chars,
+                                propagate.DEFAULT_MIN_BLOCK_CHARS),
+    }
+
+
 def _cmd_digest(args: argparse.Namespace) -> int:
     from .report.digest import write_digest
 
@@ -134,12 +185,57 @@ def _cmd_digest(args: argparse.Namespace) -> int:
     if generated_at is None:
         generated_at = utc_iso(max((event.created_at for event in events),
                                    default=until if until is not None else 0.0))
+    extra_sections: list[str] = []
+    attribution_out = Path(args.attribution_out) if args.attribution_out else None
+    if args.with_attribution or attribution_out is not None:
+        from .propagate import run_attribution
+        from .propagate.report import attribution_section_html, write_attribution
+
+        with connect(paths.db_path) as connection:
+            attribution = run_attribution(
+                connection, since=since, until=until,
+                generated_at=generated_at, **_attribution_kwargs(args))
+        extra_sections.append(attribution_section_html(attribution))
+        if attribution_out is not None:
+            write_attribution(attribution, attribution_out)
     result = write_digest(events, output, json_path=json_out, since=since,
                           until=until, generated_at=generated_at,
-                          title=args.title)
+                          title=args.title, extra_sections=extra_sections)
     print(f"digest: {result.html_path} ({result.event_count} event(s))")
     if result.json_path:
         print(f"events: {result.json_path}")
+    if attribution_out is not None:
+        print(f"attribution: {attribution_out}")
+    return 0
+
+
+def _cmd_attribute(args: argparse.Namespace) -> int:
+    from .propagate import run_attribution
+    from .propagate.report import render_attribution_json, write_attribution
+
+    paths = DataPaths(Path(args.data_dir))
+    if not paths.db_path.exists():
+        raise FileNotFoundError(f"database not found: {paths.db_path}")
+    since = parse_iso(args.since) if args.since else None
+    until = parse_iso(args.until) if args.until else None
+    with connect(paths.db_path) as connection:
+        result = run_attribution(
+            connection, since=since, until=until,
+            generated_at=args.generated_at, **_attribution_kwargs(args))
+    output = Path(args.output) if args.output else (
+        paths.out_dir / "attribution.json")
+    html_path = Path(args.html) if args.html else None
+    json_path, written_html = write_attribution(result, output,
+                                                html_path=html_path)
+    status = "degraded" if result.degraded else "ok"
+    print(f"attribution: {json_path} ({len(result.clusters)} cluster(s), "
+          f"{len(result.links)} link(s), {status})")
+    if written_html is not None:
+        print(f"attribution html: {written_html}")
+    if result.degraded:
+        print("attribution degraded: " + ", ".join(result.degrade_reasons))
+    if args.json:
+        print(render_attribution_json(result), end="")
     return 0
 
 

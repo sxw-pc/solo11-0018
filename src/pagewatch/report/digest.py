@@ -28,7 +28,8 @@ def _stable_generated_at(events: Sequence[ChangeEvent], value: str | None) -> st
 
 def render_digest(events: Sequence[ChangeEvent], *, since: float | None = None,
                   until: float | None = None, generated_at: str | None = None,
-                  title: str = "pagewatch change digest") -> str:
+                  title: str = "pagewatch change digest",
+                  extra_sections: Sequence[str] = ()) -> str:
     ordered = sorted(events, key=lambda event: (
         event.watch_name, event.created_at, event.id))
     grouped: dict[str, list[ChangeEvent]] = {}
@@ -42,6 +43,7 @@ def render_digest(events: Sequence[ChangeEvent], *, since: float | None = None,
     if not grouped:
         body.append('<section class="watch"><p class="empty">No events in '
                     "the selected period.</p></section>")
+    body.extend(extra_sections)
     return html_document(
         title=title, period_start=period_start, period_end=period_end,
         generated_at=_stable_generated_at(events, generated_at),
@@ -66,10 +68,12 @@ def write_digest(events: Sequence[ChangeEvent], html_path: str | Path, *,
                  json_path: str | Path | None = None,
                  since: float | None = None, until: float | None = None,
                  generated_at: str | None = None,
-                 title: str = "pagewatch change digest") -> DigestResult:
+                 title: str = "pagewatch change digest",
+                 extra_sections: Sequence[str] = ()) -> DigestResult:
     html_destination = Path(html_path)
     _write_text(html_destination, render_digest(
-        events, since=since, until=until, generated_at=generated_at, title=title))
+        events, since=since, until=until, generated_at=generated_at,
+        title=title, extra_sections=extra_sections))
     json_destination = Path(json_path) if json_path else None
     if json_destination is not None:
         _write_text(json_destination, render_event_json(events))
