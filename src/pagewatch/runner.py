@@ -23,7 +23,9 @@ from .normalize.pipeline import (
 )
 from .schedule.backoff import next_due_at
 from .storage.db import connect, transaction
-from .storage.events import add_audit, insert_alert, insert_event
+from .storage.events import (
+    add_audit, alert_cooldown_lock, insert_alert, insert_event,
+)
 from .storage.snapshots import (
     append_snapshot, get_schedule, get_watch_state, latest_snapshot,
     mark_snapshot_major, record_fetch_state, record_probe, upsert_schedule,
@@ -149,7 +151,10 @@ class Runner:
         diff_text = unified_diff(previous.normalized_text, page.text,
                                  rules.diff_max_chars)
         alert = None
-        with transaction(connection):
+        # Hold the dedup lock around the whole transaction so the alert row is
+        # committed (and thus visible to other threads) before any concurrent
+        # watch performs its own cooldown check.
+        with alert_cooldown_lock(), transaction(connection):
             snapshot = append_snapshot(
                 connection, watch_name=watch.name, fetched_at=checked_at,
                 status_code=result.status_code, url=watch.url, etag=result.etag,

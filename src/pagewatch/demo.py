@@ -20,7 +20,7 @@ from .config import load_all
 from .models import DataPaths
 from .report.digest import write_digest
 from .runner import Runner
-from .schedule.scheduler import execute_round
+from .schedule.scheduler import RoundFailure, execute_round
 from .storage.db import connect, init_paths
 from .storage.events import count_events, list_events
 
@@ -135,11 +135,15 @@ def run_demo(root: str | Path = "data") -> int:
             scenario.set_step(step)
             if step > 0:
                 clock.advance(60)
-            results = execute_round(watches, runner.run, max_workers=1)
+            results = execute_round(watches, runner.run, max_workers=1,
+                                    stagger_seconds=rules.jitter_seconds)
             rendered = ", ".join(
-                f"{result.watch_name}={result.outcome}"
-                + (f"/{result.severity}" if result.severity else "")
-                for result in results
+                f"{item.watch_name}="
+                + (f"error:{type(item.error).__name__}"
+                   if isinstance(item, RoundFailure) else item.outcome)
+                + ("" if isinstance(item, RoundFailure) or not item.severity
+                   else f"/{item.severity}")
+                for item in results
             )
             print(f"step {step} [{STEP_LABELS[step]}]: {rendered}")
 

@@ -3,10 +3,29 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
+from typing import Iterator
 
 from ..models import AlertRecord, ChangeEvent
 from .db import json_dump, json_load
+
+# Serializes the cooldown check-and-insert across worker threads in a process.
+# The cooldown ledger itself lives in the alerts table, so state stays durable
+# across rounds and restarts; the lock only closes the read-then-write race
+# that let concurrent threads observe the same empty cooldown window.  Callers
+# hold it around the whole database transaction so a winning insert is
+# committed and visible before another thread performs its cooldown check.
+_ALERT_LOCK = threading.RLock()
+
+
+@contextmanager
+def alert_cooldown_lock() -> Iterator[None]:
+    """Hold the process-wide alert-dedup lock across a full DB transaction."""
+    with _ALERT_LOCK:
+        yield
+
 
 EVENT_COLUMNS = (
     "id, watch_name, from_snapshot_id, to_snapshot_id, created_at, severity, "
@@ -101,25 +120,50 @@ def count_events(connection: sqlite3.Connection) -> dict[str, int]:
 def insert_alert(connection: sqlite3.Connection, *, watch_name: str,
                  severity: str, event_id: int, created_at: float,
                  message: str, cooldown_seconds: int) -> AlertRecord | None:
-    """Insert an alert unless the same watch/severity is cooling down."""
+    """Insert an alert unless the same watch/severity is cooling down.
+
+    The effective ``cooldown_seconds`` is whatever the caller passes, so the
+    per-watch override (merged in by ``effective_rules``) takes precedence over
+    the global default.  The check and insert run under a process-wide lock so
+    concurrent checks of the same watch/severity cannot both pass the cooldown
+    window.  This function does not commit: callers running inside a larger
+    transaction hold :func:`alert_cooldown_lock` around that transaction;
+    standalone callers should use :func:`record_alert`, which commits while
+    still holding the lock so the winning row becomes visible before another
+    thread's cooldown check.
+    """
     dedup_key = f"{watch_name}:{severity}"
-    if cooldown_seconds > 0:
+    with _ALERT_LOCK:
+        if cooldown_seconds > 0:
+            row = connection.execute(
+                "SELECT id FROM alerts WHERE watch_name=? AND severity=? "
+                "AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
+                (watch_name, severity, created_at - cooldown_seconds),
+            ).fetchone()
+            if row is not None:
+                return None
+        cursor = connection.execute(
+            "INSERT INTO alerts(watch_name, severity, event_id, created_at, "
+            "dedup_key, message) VALUES(?, ?, ?, ?, ?, ?)",
+            (watch_name, severity, event_id, created_at, dedup_key, message),
+        )
         row = connection.execute(
-            "SELECT id FROM alerts WHERE watch_name=? AND severity=? "
-            "AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
-            (watch_name, severity, created_at - cooldown_seconds),
+            "SELECT * FROM alerts WHERE id=?", (cursor.lastrowid,)
         ).fetchone()
-        if row is not None:
-            return None
-    cursor = connection.execute(
-        "INSERT INTO alerts(watch_name, severity, event_id, created_at, "
-        "dedup_key, message) VALUES(?, ?, ?, ?, ?, ?)",
-        (watch_name, severity, event_id, created_at, dedup_key, message),
-    )
-    row = connection.execute(
-        "SELECT * FROM alerts WHERE id=?", (cursor.lastrowid,)
-    ).fetchone()
-    return _alert(row) if row else None
+        return _alert(row) if row else None
+
+
+def record_alert(connection: sqlite3.Connection, **kwargs: object) -> AlertRecord | None:
+    """Cooldown-checked alert insert that commits while holding the lock.
+
+    Use this for short-lived connections that are not part of a larger
+    transaction: the commit happens inside the dedup lock, so the inserted row
+    is visible to other threads before they evaluate their own cooldown.
+    """
+    with _ALERT_LOCK:
+        record = insert_alert(connection, **kwargs)  # type: ignore[arg-type]
+        connection.commit()
+        return record
 
 
 def list_alerts(connection: sqlite3.Connection) -> list[AlertRecord]:

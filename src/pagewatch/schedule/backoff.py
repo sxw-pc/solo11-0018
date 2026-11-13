@@ -1,4 +1,4 @@
-"""Deterministic jitter and capped exponential failure backoff."""
+"""Deterministic jitter, intra-round staggering and capped failure backoff."""
 
 from __future__ import annotations
 
@@ -12,6 +12,18 @@ def deterministic_jitter(name: str, jitter_seconds: int, seed: int = 0) -> int:
         return 0
     digest = hashlib.sha256(f"{seed}:{name}".encode("utf-8")).hexdigest()
     return int(digest[:12], 16) % (jitter_seconds + 1)
+
+
+def stagger_offset(name: str, stagger_seconds: int, seed: int = 0) -> int:
+    """Stable intra-round start offset for a watch.
+
+    The value is a pure function of the watch name and the configured cap, so
+    it never depends on a watch's position in the input list: reordering or
+    reversing the watchlist keeps each watch's offset unchanged.  Reusing the
+    same hash family as :func:`deterministic_jitter` keeps scheduling fully
+    reproducible across runs.
+    """
+    return deterministic_jitter(name, stagger_seconds, seed)
 
 
 def backoff_delay(interval_seconds: int, failures: int,

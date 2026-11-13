@@ -15,8 +15,10 @@ from .fetch.allowlist import is_host_allowed
 from .models import DataPaths
 from .retention.compact import compact
 from .retention.policy import format_plan
-from .runner import Runner
-from .schedule.scheduler import execute_round, select_watches
+from .runner import Runner, WatchRunResult
+from .schedule.scheduler import (
+    RoundFailure, execute_round, select_watches,
+)
 from .storage.db import connect, init_paths
 from .storage.events import list_events
 from .storage.snapshots import list_schedules
@@ -104,18 +106,29 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
                               due_only=args.due_only, states=states, now=now)
     runner = Runner(db_path=paths.db_path, archive_dir=paths.archive_dir,
                     outbox_path=paths.outbox_path, rules=rules, clock=clock)
-    results = execute_round(selected, runner.run, rules.max_workers)
-    payload = [asdict(result) for result in results]
+    results = execute_round(selected, runner.run, rules.max_workers,
+                            stagger_seconds=rules.jitter_seconds)
+    # execute_round isolates an escaping callback as a RoundFailure; Runner.run
+    # normally returns its own error results, but normalize any marker so the
+    # reporting paths below always receive plain WatchRunResult-like objects.
+    normalized = [
+        result if not isinstance(result, RoundFailure)
+        else WatchRunResult(
+            watch_name=result.watch_name, outcome="error",
+            error=f"{type(result.error).__name__}: {result.error}")
+        for result in results
+    ]
+    payload = [asdict(result) for result in normalized]
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
     else:
-        for result in results:
+        for result in normalized:
             suffix = f" severity={result.severity}" if result.severity else ""
             error = f" error={result.error}" if result.error else ""
             print(f"{result.watch_name}: {result.outcome}{suffix}{error}")
-        if not results:
+        if not normalized:
             print("no watches selected")
-    return 1 if any(result.outcome == "error" for result in results) else 0
+    return 1 if any(result.outcome == "error" for result in normalized) else 0
 
 
 def _cmd_digest(args: argparse.Namespace) -> int:
