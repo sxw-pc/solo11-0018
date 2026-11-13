@@ -29,6 +29,12 @@ def compute_metrics(old_blocks: Sequence[NormalizedBlock],
     change_rate = min(1.0, changed / denominator)
     regions = tuple(sorted({region for change in changes
                             for region in change.regions}))
+    focus_regions = tuple(sorted({region for change in changes if change.focus_hit
+                                  for region in change.regions}))
+    noise_regions = tuple(sorted({region for change in changes
+                                  if change.noise_only
+                                  for region in change.regions}))
+    block_ops = tuple(change.op for change in changes)
     return DiffMetrics(
         base_lines=base_lines,
         new_lines=new_lines,
@@ -40,4 +46,10 @@ def compute_metrics(old_blocks: Sequence[NormalizedBlock],
         focus_hit=any(change.focus_hit for change in changes),
         noise_only=bool(changes) and all(change.noise_only for change in changes),
         keyword_hits=keyword_hits(changes, keywords),
+        block_ops=block_ops,
+        block_count=len(changes),
+        added_blocks=sum(1 for change in changes if change.op == "insert"),
+        removed_blocks=sum(1 for change in changes if change.op == "delete"),
+        focus_regions=focus_regions,
+        noise_regions=noise_regions,
     )

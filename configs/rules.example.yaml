@@ -10,8 +10,27 @@ classification:
 
 alerts:
   # Alerts are local-only (SQLite + JSONL). Only major is emitted by default.
+  # Eligibility always reads the final level produced by the rule engine.
   severities: ["major"]
   cooldown_seconds: 3600
+
+# Optional id-addressed rule patches, merged on top of the built-in rule set.
+# Each entry inherits every field it does not name, so it can retune, disable
+# or newly add a rule without replacing the list:
+#   - id: keyword-promote        # built-in rule id
+#     enabled: false             # this watch alone could also do this
+#   - id: pricing-spike          # new rule (needs kind)
+#     kind: threshold
+#     severity: major
+#     priority: 45
+#     threshold: 0.1
+#     direction: ">="
+#   - id: focus-and-keyword      # severity mapping over other verdicts
+#     kind: severity_mapping
+#     severity: minor
+#     priority: 80
+#     when: [focus-promote, keyword-promote]   # fires only when ALL match
+rules: []
 
 diff:
   # Unified diff text stored with each event is capped at this many characters.

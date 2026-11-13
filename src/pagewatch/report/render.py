@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import json
 from collections.abc import Iterable, Sequence
 
 from ..models import ChangeEvent
@@ -76,6 +77,34 @@ def render_diff(diff_text: str) -> str:
     return '<pre class="diff">' + "".join(lines) + "</pre>"
 
 
+def _rule_trace_html(event: ChangeEvent) -> str:
+    if not event.rule_trace:
+        return ""
+    try:
+        trace = json.loads(event.rule_trace)
+    except (TypeError, ValueError):
+        return ""
+    verdicts = trace.get("verdicts") if isinstance(trace, dict) else None
+    if not isinstance(verdicts, list):
+        return ""
+    matched = [item for item in verdicts
+               if isinstance(item, dict) and item.get("matched")]
+    if not matched:
+        return ""
+    final = esc(trace.get("final", event.severity))
+    rows = "".join(
+        f'<li><code>{esc(item.get("rule_id", "?"))}</code> '
+        f'{esc(item.get("severity", "?"))} '
+        f'<span class="meta">p{item.get("priority", "?")} '
+        f'{esc(item.get("source", "?"))}</span> '
+        f'{esc(item.get("reason") or item.get("detail") or "")}</li>'
+        for item in matched
+    )
+    return ('<details class="noise rule-trace"><summary>Rule trace '
+            f'({len(matched)} matched, final {final})</summary>'
+            f'<ul>{rows}</ul></details>')
+
+
 def render_event(event: ChangeEvent) -> str:
     from ..clock import utc_iso
 
@@ -91,6 +120,7 @@ def render_event(event: ChangeEvent) -> str:
     <span>+{event.added_lines} / −{event.removed_lines} lines</span>
     <span>focus {focus}</span><span>regions: {esc(regions)}</span>
     <span>keywords: {esc(keywords)}</span></div>
+  {_rule_trace_html(event)}
   {render_diff(event.diff_text)}
 </article>"""
 

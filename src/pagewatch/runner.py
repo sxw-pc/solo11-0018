@@ -11,7 +11,7 @@ from .alert.rules import alert_message, should_alert
 from .clock import Clock, SystemClock
 from .config import effective_rules
 from .diff.blockdiff import diff_blocks
-from .diff.classify import classify, reasons
+from .diff.classify import classify_detailed, trace_to_json
 from .diff.metrics import compute_metrics
 from .diff.textdiff import unified_diff
 from .fetch.allowlist import AllowlistError
@@ -144,8 +144,9 @@ class Runner:
         old_blocks = blocks_from_json(previous.blocks_json)
         changes = diff_blocks(old_blocks, page.blocks)
         metrics = compute_metrics(old_blocks, page.blocks, changes, watch.keywords)
-        severity = classify(metrics, rules)
-        summary = self._summary(severity, metrics, rules)
+        classification = classify_detailed(metrics, rules)
+        severity = classification.severity
+        summary = self._summary(classification, metrics)
         diff_text = unified_diff(previous.normalized_text, page.text,
                                  rules.diff_max_chars)
         alert = None
@@ -166,6 +167,7 @@ class Runner:
                 added_lines=metrics.added_lines, removed_lines=metrics.removed_lines,
                 regions=metrics.regions, keyword_hits=metrics.keyword_hits,
                 focus_hit=metrics.focus_hit, summary=summary, diff_text=diff_text,
+                rule_trace=trace_to_json(classification),
             )
             if severity == "major":
                 mark_snapshot_major(connection, snapshot.id)
@@ -192,9 +194,10 @@ class Runner:
         )
 
     @staticmethod
-    def _summary(severity: str, metrics, rules: Rules) -> str:
-        detail = ", ".join(reasons(metrics, rules, severity)) or "content-change"
-        return (f"{severity}: +{metrics.added_lines}/-{metrics.removed_lines} lines, "
+    def _summary(classification, metrics) -> str:
+        detail = ", ".join(classification.winning_reasons) or "content-change"
+        return (f"{classification.severity}: +{metrics.added_lines}/"
+                f"-{metrics.removed_lines} lines, "
                 f"rate={metrics.change_rate:.3f}, {detail}")
 
     def _schedule(self, connection, watch: WatchSpec, now: float, *,

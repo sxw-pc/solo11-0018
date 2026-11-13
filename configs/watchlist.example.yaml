@@ -12,7 +12,13 @@ watches:
     keywords: ["重要", "计费"]
     enabled: true
     rule_overrides:
+      # Scalar fields keep their flat, watch-wins meaning.
       alert_cooldown_seconds: 600
+      # id-addressed patches merge by rule: this watch ignores keyword
+      # promotion but every other rule still applies.
+      rules:
+        - id: keyword-promote
+          enabled: false
 
   - name: docs
     url: http://127.0.0.1:8765/docs

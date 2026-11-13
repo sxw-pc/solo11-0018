@@ -2,9 +2,57 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+SEVERITIES = ("noise", "minor", "major")
+RULE_KINDS = (
+    "focus",              # a changed block inside a focus region
+    "keyword",            # a user keyword appears in changed text
+    "threshold",          # change rate crosses a configured threshold
+    "noise_region",       # every changed block sits in a noise region
+    "block_structure",    # blocks were inserted or deleted, not just rewritten
+    "severity_mapping",   # map already-matched conditions to a severity
+    "default",            # unconditional fallback
+)
+RULE_DIRECTIONS = (">=", "<")
+MAX_RULE_PRIORITY = 10_000
+
+
+@dataclass(frozen=True)
+class RulePatch:
+    """A per-rule override from rules.yaml or a watch's rule_overrides.
+
+    ``None`` means "inherit the value from the rule being patched"; an omitted
+    ``rule_id`` in YAML is filled in by the loader.
+    """
+
+    rule_id: str
+    source: str
+    kind: str | None = None
+    severity: str | None = None
+    priority: int | None = None
+    enabled: bool | None = None
+    threshold: float | None = None
+    direction: str | None = None
+    when: tuple[str, ...] | None = None
+    label: str | None = None
+
+    def __post_init__(self) -> None:
+        # Structural sanity only: enum membership is checked by the engine
+        # (``RuleConfigError``) so both config loading and programmatic use
+        # report the same error type.
+        if not isinstance(self.rule_id, str) or not self.rule_id.strip():
+            raise ValueError("rule id must be a non-empty string")
+        if (self.priority is not None
+                and not 0 <= self.priority <= MAX_RULE_PRIORITY):
+            raise ValueError(f"rule priority must be 0..{MAX_RULE_PRIORITY}")
+        if self.threshold is not None and not 0.0 <= self.threshold <= 1.0:
+            raise ValueError("rule threshold must be between 0 and 1")
+        if self.direction is not None and self.direction not in RULE_DIRECTIONS:
+            raise ValueError("rule direction must be '>=' or '<'")
 
 
 @dataclass(frozen=True)
@@ -36,6 +84,9 @@ class Rules:
     jitter_seconds: int = 10
     timeout_seconds: float = 5.0
     max_bytes: int = 2_097_152
+    # Rule-engine definitions layered on top of the legacy scalar fields.
+    # These stay out of ``RULE_FIELDS``/flat overrides on purpose.
+    rules: tuple[RulePatch, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -109,6 +160,62 @@ class ChangeBlock:
     focus_hit: bool = False
     noise_only: bool = False
 
+    @property
+    def structural(self) -> bool:
+        """True when a block appeared or disappeared entirely."""
+        return self.op in {"insert", "delete"}
+
+
+@dataclass(frozen=True)
+class RuleVerdict:
+    """One rule's opinion, annotated for replay and auditing."""
+
+    rule_id: str
+    kind: str
+    source: str
+    severity: str
+    priority: int
+    matched: bool
+    reason: str
+    detail: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        for key in ("reason", "detail"):
+            if not value[key]:
+                value.pop(key)
+        return value
+
+
+@dataclass(frozen=True)
+class Classification:
+    """Final severity plus the full, ordered rule trace that produced it."""
+
+    severity: str
+    trace: tuple[RuleVerdict, ...] = ()
+    engine_version: str = ""
+
+    @property
+    def matched(self) -> tuple[RuleVerdict, ...]:
+        return tuple(verdict for verdict in self.trace if verdict.matched)
+
+    @property
+    def reasons(self) -> list[str]:
+        return [verdict.reason for verdict in self.matched]
+
+    @property
+    def winning_reasons(self) -> list[str]:
+        """Reasons of matching rules at the winning level (legacy summary)."""
+        return [verdict.reason for verdict in self.matched
+                if verdict.severity == self.severity and verdict.reason]
+
+    def explain(self) -> dict[str, Any]:
+        return {
+            "engine_version": self.engine_version,
+            "final": self.severity,
+            "verdicts": [verdict.as_dict() for verdict in self.trace],
+        }
+
 
 @dataclass(frozen=True)
 class DiffMetrics:
@@ -122,6 +229,12 @@ class DiffMetrics:
     focus_hit: bool
     noise_only: bool
     keyword_hits: tuple[str, ...]
+    block_ops: tuple[str, ...] = ()
+    block_count: int = 0
+    added_blocks: int = 0
+    removed_blocks: int = 0
+    focus_regions: tuple[str, ...] = ()
+    noise_regions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,12 +271,20 @@ class ChangeEvent:
     focus_hit: bool
     summary: str
     diff_text: str
+    rule_trace: str = ""
 
     def as_json(self) -> dict[str, Any]:
         value = asdict(self)
         value["regions"] = list(self.regions)
         value["keyword_hits"] = list(self.keyword_hits)
         value["focus_hit"] = self.focus_hit
+        if self.rule_trace:
+            try:
+                value["rule_trace"] = json.loads(self.rule_trace)
+            except (TypeError, ValueError):
+                value["rule_trace"] = self.rule_trace
+        else:
+            value.pop("rule_trace", None)
         return value
 
 

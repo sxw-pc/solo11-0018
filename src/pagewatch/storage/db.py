@@ -10,7 +10,7 @@ from typing import Any, Iterator
 
 from ..models import DataPaths
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -74,7 +74,8 @@ CREATE TABLE IF NOT EXISTS events (
     keyword_hits_json TEXT NOT NULL,
     focus_hit INTEGER NOT NULL DEFAULT 0,
     summary TEXT NOT NULL,
-    diff_text TEXT NOT NULL
+    diff_text TEXT NOT NULL,
+    rule_trace_json TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_events_time ON events(created_at);
 CREATE INDEX IF NOT EXISTS idx_events_watch ON events(watch_name, created_at);
@@ -148,12 +149,30 @@ def transaction(connection: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
 def init_db(db_path: str | Path) -> None:
     with connect(db_path) as connection:
         connection.executescript(SCHEMA)
+        _migrate(connection)
         connection.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
         connection.commit()
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Bring databases created by an older version up to current.
+
+    Only additive changes are performed, so historical rows keep their values
+    and severity.
+    """
+    event_columns = {
+        row["name"] for row in
+        connection.execute("PRAGMA table_info(events)").fetchall()
+    }
+    if "rule_trace_json" not in event_columns:
+        connection.execute(
+            "ALTER TABLE events ADD COLUMN rule_trace_json TEXT NOT NULL "
+            "DEFAULT ''"
+        )
 
 
 def init_paths(paths: DataPaths) -> None:

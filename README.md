@@ -111,7 +111,7 @@ watches:
 | `noise_patterns` | 否 | `[]` | 正则列表；匹配到动态串后替换为稳定 `[NOISE]` |
 | `keywords` | 否 | `[]` | 变更后文本命中任一关键词即判 major |
 | `enabled` | 否 | `true` | 关闭后不参与调度 |
-| `rule_overrides` | 否 | `{}` | 逐监视项覆盖全局 rules 的扁平字段 |
+| `rule_overrides` | 否 | `{}` | 逐监视项覆盖全局 rules：标量字段按扁平“监视项优先”合并；`rules` 子列表按规则 id 合并，可逐规则启停/调参 |
 
 ### rules.yaml
 
@@ -130,9 +130,38 @@ watches:
 | `schedule.jitter_seconds` | `10` | 按监视项名称确定性错峰的上限 |
 | `fetch.timeout_seconds` | `5` | 连接/读取超时 |
 | `fetch.max_bytes` | `2097152` | 响应体硬上限（2 MiB） |
+| `rules` | `[]` | 可选的按规则 id 补丁列表，叠加在内置规则集之上（见下节） |
 
-变更率定义为 `(新增行 + 删除行) / max(旧行数, 新行数, 1)`。分级优先级：
-`focus/keyword/high-rate → major`；否则 `noise-only 或低于噪声下界 → noise`；其余 `minor`。
+变更率定义为 `(新增行 + 删除行) / max(旧行数, 新行数, 1)`。分级由规则引擎裁决：
+每条规则独立产出带 `severity / priority / source / reason` 的裁决记录，
+最终级别取**命中规则中优先级最高者**；同优先级时按固定次序收敛：
+先按规则类别（`severity_mapping > focus > keyword > threshold > block_structure > noise_region > default`），
+再按规则 id 字典序。因此同一输入、同一配置的结论可复现。
+
+内置规则（id → 类别/优先级）：
+`focus-promote`（focus/60，major）、`keyword-promote`（keyword/50，major）、
+`high-change-rate`（threshold/40，`>= major_change_rate` → major）、
+`below-noise-floor`（threshold/40，`< noise_max_change_rate` → noise）、
+`noise-region-only`（noise_region/30 → noise）、`block-structure-change`（block_structure/25 → minor）、
+`fallback-minor`（default/0 → minor）。默认规则集与升级前的分级结果完全一致。
+
+### 规则引擎与 overrides 合并语义
+
+`rules.yaml` 与 watchlist 的 `rule_overrides` 都接受 `rules:` 列表；每条按 `id` 合并到当前规则链：
+
+| 情形 | 写法 | 语义 |
+|---|---|---|
+| 新增规则 | `{id: pricing-spike, kind: threshold, severity: major, threshold: 0.1}` | 未知名 + `kind` 追加新规则，内置规则全部保留 |
+| 禁用规则 | `{id: keyword-promote, enabled: false}` | 规则仍在裁决记录中以 `disabled by override` 出现，但不参与胜负 |
+| 继承默认 | `{id: high-change-rate, threshold: 0.6}` | 未写字段逐项继承上一层，只改点名项 |
+
+层级顺序为 内置默认 → `rules.yaml` 的 `rules:` → 监视项 `rules_overrides.rules`；后者可覆盖前者，未点名的规则继续继承。
+监视项内 `rules:` 也可写成映射形式 `{rule-id: {...}}` 以省略 `id`。
+`severity_mapping` 规则的 `when` 是**合取**：所列规则全部命中时才触发，用于在多个信号同时成立时做限级。
+`check-config` 会校验规则 id 冲突、类别、取值范围、阈值先后关系与 `when` 引用；错误信息带文件与规则 id。
+
+旧标量字段（`classification.major_change_rate` 等）继续有效，并会以最后一层补丁的形式同步到对应内置规则，
+因此监视项标量覆盖仍然优先于全局 `rules:` 补丁。
 `check-config` 会校验缺字段、未知字段、URL/凭据/白名单、CSS/正则语法、间隔下界、重复名称和规则范围，错误信息带文件与条目定位。
 
 ## 命令参考
@@ -181,7 +210,7 @@ SQLite 表概览：
 | `watches` | 监视项、最近 ETag/Last-Modified、最近抓取状态 |
 | `snapshots` | 每监视项版本链：规范化全文、块 JSON、内容哈希、原始哈希、是否 major |
 | `probes` | 每次探测记录；304 也写入且 `not_modified=1` |
-| `events` | 变更事件：分级、变更率、增删行、区域、关键词、截断 diff |
+| `events` | 变更事件：分级、变更率、增删行、区域、关键词、截断 diff、可回放的规则裁决记录 |
 | `alerts` | 告警台账，`(watch, severity, created_at)` 用于冷却去重 |
 | `schedule_state` | 持久化 `next_due_at`、连续失败数、最近结果 |
 | `audit_log` | 白名单拒绝、抓取错误、compact 等审计事件 |
@@ -192,6 +221,7 @@ SQLite 表概览：
 - **归一化器版本**：快照记录 `normalizer-v1`，便于未来重算比对。
 - **调度**：每项独立周期 + 基于名称哈希的确定性错峰；失败按 `interval × 2^failures` 指数退避且封顶 1 小时；恢复成功立即归零。下次时间从“当前时刻”计算，错过超过一轮不补跑。
 - **告警**：命中 `alert.severities` 后先写 SQLite，再追加 JSONL；冷却期内同监视项同级重复告警被去重。
+  资格判定读取规则引擎的**最终级别**，冷却键仍为 `(watch_name, severity)`。
 - **保留**：`compact` 按监视项保留最新 N 版，major 目标版本豁免；未被任何保留快照引用的旧 gzip 超期后删除。执行幂等并累计统计。
 
 outbox 每行示例（虚构）：
@@ -214,7 +244,7 @@ outbox 每行示例（虚构）：
 
 ## 测试与验收
 
-- `pytest -q`：64 个测试，全绿；不依赖网络和真实时间。
+- `pytest -q`：86 个测试，全绿；不依赖网络和真实时间。
 - `tests/conftest.py` 中的 socket 守卫 monkeypatch `connect` / `connect_ex`，会话结束断言无任何非本机连接尝试。
 - 时钟通过 `FrozenClock` 注入；数据目录均使用 `tmp_path` 隔离。
 - 核心模块（normalize / diff / classify / retention）单文件行覆盖率均 ≥85%；全项目约 85%。

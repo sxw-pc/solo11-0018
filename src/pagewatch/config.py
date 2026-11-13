@@ -12,14 +12,23 @@ import soupsieve
 import yaml
 
 from .fetch.allowlist import AllowlistError, ensure_url_allowed
-from .models import Rules, WatchSpec
+from .models import (
+    MAX_RULE_PRIORITY, RULE_DIRECTIONS, RULE_KINDS, SEVERITIES, RulePatch,
+    Rules, WatchSpec,
+)
 
 MIN_INTERVAL_SECONDS = 10
-RULE_FIELDS = {item.name for item in fields(Rules)}
+_LEGACY_RULE_FIELDS = {item.name for item in fields(Rules)} - {"rules"}
+RULE_FIELDS = _LEGACY_RULE_FIELDS
 WATCH_FIELDS = {
     "name", "url", "interval_seconds", "tags", "include_selectors",
     "exclude_selectors", "noise_patterns", "keywords", "enabled",
     "rule_overrides",
+}
+OVERRIDE_FIELDS = RULE_FIELDS | {"rules"}
+RULE_PATCH_KEYS = {
+    "id", "kind", "severity", "priority", "enabled", "threshold",
+    "direction", "when", "label",
 }
 
 
@@ -147,11 +156,11 @@ def _watch(data: Any, path: Path, index: int) -> WatchSpec:
     overrides = data.get("rule_overrides") or {}
     if not isinstance(overrides, dict):
         raise ConfigError("rule_overrides must be a mapping", path, location)
-    unknown_rules = set(overrides) - RULE_FIELDS
+    unknown_rules = set(overrides) - OVERRIDE_FIELDS
     if unknown_rules:
         raise ConfigError("unknown rule override(s): " +
                           ", ".join(sorted(unknown_rules)), path, location)
-    overrides = _clean_overrides(overrides, path, location)
+    overrides = _clean_overrides(overrides, path, location, source="watch")
     return WatchSpec(
         name=name.strip(), url=url, interval_seconds=interval, tags=tags,
         include_selectors=includes, exclude_selectors=excludes,
@@ -160,11 +169,127 @@ def _watch(data: Any, path: Path, index: int) -> WatchSpec:
     )
 
 
-def _clean_overrides(values: dict[str, Any], path: Path, location: str) -> dict[str, Any]:
+def _rule_patch(data: Any, path: Path, location: str, *,
+                source: str, filler: str) -> RulePatch:
+    """Parse one rule entry from a ``rules:`` list.
+
+    An entry may name an existing rule (inherit unnamed fields) or introduce a
+    new rule, which then needs ``kind``.  Watch overrides may omit the id,
+    in which case ``filler`` selects the rule to patch; this is how a watch
+    disables one specific rule without touching the rest.
+    """
+    if not isinstance(data, dict):
+        raise ConfigError("each rules entry must be a mapping", path, location)
+    unknown = set(data) - RULE_PATCH_KEYS
+    if unknown:
+        raise ConfigError("unknown rule field(s): " + ", ".join(sorted(unknown)),
+                          path, location)
+    rule_id = data.get("id", filler)
+    if not isinstance(rule_id, str) or not rule_id.strip():
+        raise ConfigError("rule id must be a non-empty string", path, location)
+    rule_id = rule_id.strip()
+    location = f"{location} ({rule_id})"
+    kind = data.get("kind")
+    if kind is not None and kind not in RULE_KINDS:
+        raise ConfigError("kind must be one of " + ", ".join(RULE_KINDS),
+                          path, location)
+    severity = data.get("severity")
+    if severity is not None:
+        if severity not in SEVERITIES:
+            raise ConfigError("severity must be noise, minor or major",
+                              path, location)
+    priority = data.get("priority")
+    if priority is not None:
+        priority = _int(priority, path, location, "priority", 0)
+        if priority > MAX_RULE_PRIORITY:
+            raise ConfigError(f"priority must be <= {MAX_RULE_PRIORITY}",
+                              path, location)
+    enabled = data.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        raise ConfigError("enabled must be a boolean", path, location)
+    threshold = data.get("threshold")
+    if threshold is not None:
+        threshold = _number(threshold, path, location, "threshold", 0.0, 1.0)
+    direction = data.get("direction")
+    if direction is not None and direction not in RULE_DIRECTIONS:
+        raise ConfigError("direction must be '>=' or '<'", path, location)
+    when = data.get("when")
+    if when is not None:
+        when = _strings(when, path, location, "when")
+        if not when:
+            raise ConfigError("when must list at least one rule id", path, location)
+    label = data.get("label")
+    if label is not None and (not isinstance(label, str) or not label.strip()):
+        raise ConfigError("label must be a non-empty string", path, location)
+    try:
+        return RulePatch(
+            rule_id=rule_id, source=source, kind=kind, severity=severity,
+            priority=priority, enabled=enabled, threshold=threshold,
+            direction=direction, when=when, label=label.strip() if label else None,
+        )
+    except ValueError as exc:  # dataclass is permissive; validation is below
+        raise ConfigError(str(exc), path, location) from exc
+
+
+def _rule_patches(value: Any, path: Path, location: str, *,
+                  source: str) -> tuple[RulePatch, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, dict):
+        items: list[Any] = []
+        for rule_id, patch in value.items():
+            if not isinstance(patch, dict):
+                raise ConfigError(
+                    f"rule {rule_id!r} must map to a rule definition", path, location)
+            items.append({"id": rule_id, **patch})
+    elif isinstance(value, list):
+        items = value
+    else:
+        raise ConfigError("rules must be a list of mappings", path, location)
+    patches = [_rule_patch(item, path, location, source=source, filler="")
+               for item in items]
+    seen: set[str] = set()
+    for patch in patches:
+        if patch.rule_id in seen:
+            raise ConfigError(f"duplicate rule override: {patch.rule_id}",
+                              path, location)
+        seen.add(patch.rule_id)
+    # Validate global layers eagerly so config errors point at the file.
+    # Watch patches are validated later, once merged with the global layer:
+    # they are allowed to address rules the global file introduces.
+    if source != "watch":
+        from .diff.classify import RuleConfigError, build_rule_set
+        try:
+            build_rule_set(Rules(rules=patches))
+        except RuleConfigError as exc:
+            raise ConfigError(str(exc), path, location) from exc
+    elif patches:
+        # A watch patch may target a global rule, so a plain load_watchlist
+        # cannot resolve ids.  Range-check the fields here anyway so a bad
+        # watch file still fails close to its own source.
+        for patch in patches:
+            _check_patch_ranges(patch, path, location)
+    return tuple(patches)
+
+
+def _check_patch_ranges(patch: RulePatch, path: Path, location: str) -> None:
+    from .diff.classify import RuleConfigError, _new_rule
+    if patch.kind is not None:
+        try:
+            _new_rule(patch)
+        except RuleConfigError as exc:
+            raise ConfigError(str(exc), path, location) from exc
+
+
+def _clean_overrides(values: dict[str, Any], path: Path, location: str,
+                     *, source: str) -> dict[str, Any]:
     cleaned: dict[str, Any] = {}
     sequence_fields = {"focus_selectors", "alert_severities"}
     for key, value in values.items():
-        if key in sequence_fields:
+        if key == "rules":
+            cleaned["rules"] = _rule_patches(value, path, location,
+                                             source=source)
+        elif key in sequence_fields:
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise ConfigError(f"{key} must be a list of strings", path, location)
             if key == "focus_selectors":
@@ -214,6 +339,7 @@ def _rules_from_data(data: dict[str, Any], path: Path) -> Rules:
     retention = data.get("retention", {})
     schedule = data.get("schedule", {})
     fetch = data.get("fetch", {})
+    rules_section = data.get("rules", {})
     section_keys = {
         "classification": {"noise_max_change_rate", "major_change_rate",
                            "focus_selectors"},
@@ -223,15 +349,23 @@ def _rules_from_data(data: dict[str, Any], path: Path) -> Rules:
         "schedule": {"max_workers", "jitter_seconds"},
         "fetch": {"timeout_seconds", "max_bytes"},
     }
+    if rules_section is None:
+        rules_section = ()
+    if not isinstance(rules_section, (list, dict)):
+        raise ConfigError("rules must be a list of mappings", path, "rules")
     for label, value in (("classification", classification), ("alerts", alerts),
                          ("diff", diff), ("retention", retention),
                          ("schedule", schedule), ("fetch", fetch)):
         if not isinstance(value, dict):
             raise ConfigError(f"{label} must be a mapping", path, label)
+    for label, value in (("classification", classification), ("alerts", alerts),
+                         ("diff", diff), ("retention", retention),
+                         ("schedule", schedule), ("fetch", fetch)):
         unknown = set(value) - section_keys[label]
         if unknown:
             raise ConfigError(f"unknown field(s): {', '.join(sorted(unknown))}",
                               path, label)
+    rule_patches = _rule_patches(rules_section, path, "rules", source="global")
     focus = _strings(classification.get("focus_selectors"), path,
                      "classification.focus_selectors", "focus_selectors")
     _compile_selectors(focus, path, "classification.focus_selectors")
@@ -268,11 +402,16 @@ def _rules_from_data(data: dict[str, Any], path: Path) -> Rules:
                                 0.1, 300, 5.0),
         max_bytes=_int(fetch.get("max_bytes"), path, "fetch.max_bytes",
                        "max_bytes", 1024, 2_097_152),
+        rules=rule_patches,
     )
     if not isinstance(rules.major_keep_forever, bool):
         raise ConfigError("retention.major_keep_forever must be a boolean", path)
-    if rules.noise_max_change_rate > rules.major_change_rate:
-        raise ConfigError("noise_max_change_rate must not exceed major_change_rate", path)
+    from .diff.classify import effective_thresholds
+    noise_floor, major_rate = effective_thresholds(rules)
+    if noise_floor > major_rate:
+        raise ConfigError(
+            "noise_max_change_rate must not exceed major_change_rate "
+            f"(resolved {noise_floor:g} > {major_rate:g})", path)
     return rules
 
 
@@ -280,20 +419,68 @@ def load_rules(path: str | Path) -> Rules:
     path = Path(path)
     data = _load_yaml(path)
     unknown = set(data) - {"version", "classification", "alerts", "diff",
-                           "retention", "schedule", "fetch"}
+                           "retention", "schedule", "fetch", "rules"}
     if unknown:
         raise ConfigError(f"unknown top-level field(s): {', '.join(sorted(unknown))}", path)
     return _rules_from_data(data, path)
 
 
 def effective_rules(base: Rules, watch: WatchSpec) -> Rules:
-    """Merge a watch's validated overrides onto the global rule set."""
+    """Merge a watch's validated overrides onto the global rule set.
+
+    Scalar overrides keep their legacy flat meaning.  ``rules`` entries are
+    not flat at all: they are id-addressed patches appended after the global
+    patches, so an override can disable or retune one rule while every other
+    rule keeps inheriting from the global layer.
+
+    A legacy scalar rate override (``major_change_rate`` /
+    ``noise_max_change_rate``) is also expressed as a last-layer patch for the
+    matching built-in threshold rule.  Without that, a global ``rules:``
+    entry could silently outrank the watch scalar, which is the opposite of
+    the old "watch wins" semantics.
+    """
     if not watch.rules_overrides:
         return base
     values = dict(watch.rules_overrides)
-    return replace(base, **values)
+    patches = tuple(values.pop("rules", ()))
+    merged = replace(base, **values)
+    implicit: list[RulePatch] = []
+    if "major_change_rate" in values:
+        implicit.append(RulePatch(
+            rule_id="high-change-rate", source=f"watch:{watch.name}",
+            threshold=float(values["major_change_rate"]),
+        ))
+    if "noise_max_change_rate" in values:
+        implicit.append(RulePatch(
+            rule_id="below-noise-floor", source=f"watch:{watch.name}",
+            threshold=float(values["noise_max_change_rate"]),
+        ))
+    explicit_ids = {patch.rule_id for patch in patches}
+    implicit = [patch for patch in implicit if patch.rule_id not in explicit_ids]
+    if patches or implicit:
+        renamed = tuple(replace(patch, source=f"watch:{watch.name}")
+                        for patch in patches)
+        merged = replace(merged, rules=tuple(base.rules) + renamed
+                         + tuple(implicit))
+    return merged
 
 
 def load_all(watchlist_path: str | Path, rules_path: str | Path) -> tuple[list[WatchSpec], Rules]:
-    return load_watchlist(watchlist_path), load_rules(rules_path)
+    watches = load_watchlist(watchlist_path)
+    rules = load_rules(rules_path)
+    from .diff.classify import RuleConfigError, build_rule_set, effective_thresholds
+    for watch in watches:
+        merged = effective_rules(rules, watch)
+        try:
+            build_rule_set(merged)
+        except RuleConfigError as exc:
+            raise ConfigError(str(exc), watchlist_path,
+                              f"watch {watch.name!r}") from exc
+        noise_floor, major_rate = effective_thresholds(merged)
+        if noise_floor > major_rate:
+            raise ConfigError(
+                "noise_max_change_rate must not exceed major_change_rate "
+                f"(resolved {noise_floor:g} > {major_rate:g})",
+                watchlist_path, f"watch {watch.name!r}")
+    return watches, rules
 

@@ -11,7 +11,7 @@ from .db import json_dump, json_load
 EVENT_COLUMNS = (
     "id, watch_name, from_snapshot_id, to_snapshot_id, created_at, severity, "
     "change_rate, added_lines, removed_lines, regions_json, keyword_hits_json, "
-    "focus_hit, summary, diff_text"
+    "focus_hit, summary, diff_text, rule_trace_json"
 )
 
 
@@ -26,6 +26,7 @@ def _event(row: sqlite3.Row) -> ChangeEvent:
         keyword_hits=tuple(json_load(row["keyword_hits_json"], [])),
         focus_hit=bool(row["focus_hit"]), summary=row["summary"],
         diff_text=row["diff_text"],
+        rule_trace=row["rule_trace_json"] or "",
     )
 
 
@@ -42,15 +43,16 @@ def insert_event(connection: sqlite3.Connection, *, watch_name: str,
                  severity: str, change_rate: float, added_lines: int,
                  removed_lines: int, regions: Sequence[str],
                  keyword_hits: Sequence[str], focus_hit: bool, summary: str,
-                 diff_text: str) -> ChangeEvent:
+                 diff_text: str, rule_trace: str = "") -> ChangeEvent:
     cursor = connection.execute(
         "INSERT INTO events(watch_name, from_snapshot_id, to_snapshot_id, "
         "created_at, severity, change_rate, added_lines, removed_lines, "
-        "regions_json, keyword_hits_json, focus_hit, summary, diff_text) "
-        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "regions_json, keyword_hits_json, focus_hit, summary, diff_text, "
+        "rule_trace_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (watch_name, from_snapshot_id, to_snapshot_id, created_at, severity,
          change_rate, added_lines, removed_lines, json_dump(list(regions)),
-         json_dump(list(keyword_hits)), int(focus_hit), summary, diff_text),
+         json_dump(list(keyword_hits)), int(focus_hit), summary, diff_text,
+         rule_trace),
     )
     row = connection.execute(
         f"SELECT {EVENT_COLUMNS} FROM events WHERE id=?", (cursor.lastrowid,)
