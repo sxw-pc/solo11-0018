@@ -12,6 +12,12 @@ from . import __version__
 from .clock import Clock, SystemClock, parse_iso, utc_iso
 from .config import ConfigError, load_all, load_rules
 from .fetch.allowlist import is_host_allowed
+from .history import (
+    DEFAULT_LIMIT, HistoryError, HistoryQuery, MAX_LIMIT, export_jsonl,
+    load_tag_snapshot, query_events, read_cursor_file, write_cursor_file,
+    write_cursor_state,
+)
+from .history.reader import connect_readonly
 from .models import DataPaths
 from .retention.compact import compact
 from .retention.policy import format_plan
@@ -77,8 +83,79 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--port", type=int, default=8766)
     status.set_defaults(func=_cmd_serve_status)
 
+    history = sub.add_parser(
+        "history",
+        help="query change history by watch/tag/severity/time, with cursors",
+    )
+    history.add_argument("--data-dir", default="data")
+    history.add_argument("--config", default=None,
+                         help="optional watchlist; enables closed/deleted "
+                              "lifecycle detection for --tag filters")
+    history.add_argument("--name", action="append", default=[],
+                         help="watch name (repeatable; union)")
+    history.add_argument("--tag", action="append", default=[],
+                         help="watch tag (repeatable; union unless "
+                              "--tag-match all)")
+    history.add_argument("--tag-match", choices=["any", "all"], default="any")
+    history.add_argument("--severity", action="append", default=[],
+                         help="noise/minor/major (repeatable; union)")
+    history.add_argument("--since", default=None,
+                         help="inclusive lower bound (ISO-8601 or epoch)")
+    history.add_argument("--until", default=None,
+                         help="exclusive upper bound (ISO-8601 or epoch)")
+    history.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
+                         help=f"page size, 1..{MAX_LIMIT}")
+    history.add_argument("--cursor", default=None,
+                         help="continuation cursor returned by the previous page")
+    history.add_argument("--cursor-file", default=None,
+                         help="read the cursor from a file written by "
+                              "--cursor-out (mutually exclusive with --cursor)")
+    history.add_argument("--cursor-out", default=None,
+                         help="persist the continuation cursor to this file")
+    history.add_argument("--json", action="store_true",
+                         help="emit the page envelope as a single JSON document")
+    history.add_argument("--out", default=None,
+                         help="also write matching events to this JSONL file")
+    history.add_argument("--append", action="store_true",
+                         help="append to --out instead of refusing to "
+                              "overwrite an existing file")
+    history.set_defaults(func=_cmd_history)
+
+    export = sub.add_parser(
+        "export-history",
+        help="export one history page as JSONL and persist the next cursor",
+    )
+    export.add_argument("--data-dir", default="data")
+    export.add_argument("--config", default=None)
+    export.add_argument("--name", action="append", default=[])
+    export.add_argument("--tag", action="append", default=[])
+    export.add_argument("--tag-match", choices=["any", "all"], default="any")
+    export.add_argument("--severity", action="append", default=[])
+    export.add_argument("--since", default=None)
+    export.add_argument("--until", default=None)
+    export.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    export.add_argument("--cursor", default=None)
+    export.add_argument("--cursor-file", default=None)
+    export.add_argument("--out", required=True,
+                         help="JSONL destination for this page")
+    export.add_argument("--cursor-out", required=True,
+                         help="where to persist the cursor for the next pull")
+    export.add_argument("--append", action="store_true")
+    export.add_argument("--json", action="store_true")
+    export.set_defaults(func=_cmd_export_history)
+
     demo = sub.add_parser("demo", help="run the bundled end-to-end demo")
     demo.set_defaults(func=_cmd_demo)
+
+    acceptance = sub.add_parser(
+        "history-acceptance",
+        help="run the offline reproducible acceptance scenario for history",
+    )
+    acceptance.add_argument("--output-dir", default="data/acceptance")
+    acceptance.add_argument("--with-writer-stress", action="store_true",
+                            help="also run the timing-dependent "
+                                 "continuous-writer stress check")
+    acceptance.set_defaults(func=_cmd_history_acceptance)
     return parser
 
 
@@ -171,9 +248,133 @@ def _cmd_serve_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_history(args: argparse.Namespace) -> int:
+    query = _history_query(args)
+    cursor = _history_cursor(args)
+    paths = _history_paths(args)
+    with connect_readonly(paths.db_path) as connection:
+        snapshot = load_tag_snapshot(connection, _optional_watches(args))
+        page = query_events(connection, query, cursor=cursor,
+                            limit=args.limit, tag_snapshot=snapshot)
+        batch = None
+        if args.out:
+            # The export reuses the exact same query code; keeping it here
+            # (instead of re-serialising the page) preserves dedupe-on-append
+            # and the "never truncate an existing ledger" guarantee.
+            batch = export_jsonl(connection, query, args.out,
+                                 cursor=cursor, page_size=args.limit,
+                                 append=args.append, tag_snapshot=snapshot)
+    next_cursor = batch.next_cursor if batch is not None else page.next_cursor
+    if args.cursor_out:
+        write_cursor_state(args.cursor_out, next_cursor, query,
+                           exhausted=(batch.exhausted if batch is not None
+                                      else page.exhausted),
+                           has_more=(batch.has_more if batch is not None
+                                     else page.has_more),
+                           records=(batch.records if batch is not None
+                                    else len(page.events)))
+    if args.json:
+        payload = page.as_dict()
+        payload["next_cursor"] = next_cursor
+        if batch is not None:
+            payload["jsonl_path"] = str(batch.path)
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for event in page.events:
+            print(f"{utc_iso(event.created_at)} {event.watch_name} "
+                  f"{event.severity} seq={event.id} "
+                  f"+{event.added_lines}/-{event.removed_lines} "
+                  f"{event.summary}")
+        for degraded in page.degraded_watches:
+            print(f"degraded: watch={degraded.name} state={degraded.state} "
+                  f"source={degraded.source}", file=sys.stderr)
+        print(f"events: {len(page.events)} watermark={page.watermark} "
+              f"has_more={str(page.has_more).lower()} "
+              f"exhausted={str(page.exhausted).lower()}")
+        print(f"next_cursor: {next_cursor}")
+        if args.out:
+            print(f"jsonl: {args.out}")
+        if args.cursor_out:
+            print(f"cursor_file: {args.cursor_out}")
+    return 0
+
+
+def _cmd_export_history(args: argparse.Namespace) -> int:
+    query = _history_query(args)
+    cursor = _history_cursor(args)
+    paths = _history_paths(args)
+    with connect_readonly(paths.db_path) as connection:
+        snapshot = load_tag_snapshot(connection, _optional_watches(args))
+        batch = export_jsonl(connection, query, args.out, cursor=cursor,
+                             page_size=args.limit, append=args.append,
+                             tag_snapshot=snapshot)
+    write_cursor_file(args.cursor_out, batch, query)
+    if args.json:
+        print(json.dumps(batch.as_dict(), ensure_ascii=False, indent=2,
+                         sort_keys=True))
+    else:
+        if batch.cursor_only:
+            print(f"exported 0 record(s); {batch.path} left unchanged")
+        else:
+            print(f"exported {batch.records} record(s) to {batch.path}")
+        if batch.skipped_duplicates:
+            print(f"skipped {batch.skipped_duplicates} duplicate(s) "
+                  "already present in the file")
+        if batch.degraded_watches:
+            print("degraded: " + ", ".join(batch.degraded_watches),
+                  file=sys.stderr)
+        print(f"exhausted={str(batch.exhausted).lower()} "
+              f"cursor_file={args.cursor_out}")
+    return 0
+
+
+def _history_paths(args: argparse.Namespace) -> DataPaths:
+    paths = DataPaths(Path(args.data_dir))
+    if not paths.db_path.exists():
+        raise FileNotFoundError(f"database not found: {paths.db_path}")
+    return paths
+
+
+def _history_query(args: argparse.Namespace) -> HistoryQuery:
+    since = parse_iso(args.since) if args.since else None
+    until = parse_iso(args.until) if args.until else None
+    try:
+        return HistoryQuery(
+            watch_names=tuple(args.name), tags=tuple(args.tag),
+            severities=tuple(args.severity), since=since, until=until,
+            tag_match=args.tag_match,
+        )
+    except HistoryError as exc:
+        exc.detail.setdefault("filters", {
+            "names": args.name, "tags": args.tag, "severities": args.severity,
+            "since": args.since, "until": args.until})
+        raise
+
+
+def _history_cursor(args: argparse.Namespace) -> str | None:
+    if args.cursor and args.cursor_file:
+        raise ValueError("--cursor and --cursor-file are mutually exclusive")
+    if args.cursor_file:
+        return read_cursor_file(args.cursor_file)
+    return args.cursor
+
+
+def _optional_watches(args: argparse.Namespace) -> list | None:
+    if not args.config:
+        return None
+    from .config import load_watchlist
+    return load_watchlist(args.config)
+
+
 def _cmd_demo(_: argparse.Namespace) -> int:
     from .demo import run_demo
     return run_demo()
+
+
+def _cmd_history_acceptance(args: argparse.Namespace) -> int:
+    from .history.acceptance import run_acceptance
+    return run_acceptance(args.output_dir,
+                          mock_writers=args.with_writer_stress)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -181,6 +382,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
+    except HistoryError as exc:
+        # Machine-distinguishable taxonomy: each code has its own exit status
+        # so a downstream puller can branch without parsing text.
+        if getattr(args, "json", False):
+            print(json.dumps(exc.as_dict(), ensure_ascii=False,
+                             sort_keys=True), file=sys.stderr)
+        else:
+            print(f"error[{exc.code}]: {exc.message}", file=sys.stderr)
+        return exc.exit_code
     except (ConfigError, FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

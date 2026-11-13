@@ -76,6 +76,7 @@ src/pagewatch/           cli / config / models / runner / clock
   schedule/              错峰、退避、并发上限
   report/                digest 渲染与只读状态页
   retention/             保留策略与 compact
+  history/               只读历史查询、稳定游标、JSONL 增量导出与验收
 mocksite/                确定性 Flask 模拟站点与剧本
 tests/                   单元、集成、离线守卫与 fixtures
 ```
@@ -158,11 +159,58 @@ pagewatch compact --data-dir data
 # 只读状态页，只允许绑定 127.0.0.1
 pagewatch serve-status --data-dir data --port 8766
 
+# 历史查询：按监视项/标签/级别/时间组合过滤，游标分页
+pagewatch history --data-dir data --tag priority --severity major \
+                  --since 2026-01-01T00:00:00Z --until 2026-01-02T00:00:00Z \
+                  --limit 50 --json
+pagewatch history --data-dir data --name docs --limit 50 \
+                  --cursor '<上一页返回的 next_cursor>'
+pagewatch history --data-dir data --name docs --limit 50 \
+                  --cursor-out data/out/history.cursor.json
+
+# 增量 JSONL 导出：一次一页，游标文件断点续拉
+pagewatch export-history --data-dir data --severity major --limit 200 \
+                  --out data/out/audit.jsonl \
+                  --cursor-out data/out/audit.cursor.json
+pagewatch export-history --data-dir data --severity major --limit 200 \
+                  --cursor-file data/out/audit.cursor.json \
+                  --out data/out/audit.jsonl --append \
+                  --cursor-out data/out/audit.cursor.json
+
+# 离线可复现历史查询验收（两轮续拉 + 并发写期间旧游标推进）
+pagewatch history-acceptance --output-dir data/acceptance
+
 # 演示；也可 python -m pagewatch.demo
 pagewatch demo
 ```
 
 `digest` 的 HTML/JSON 排序固定、无 JavaScript、无外部资源；`--generated-at` 可显式固定页眉时间，因此相同数据和参数生成逐字节一致的文件。
+
+## 历史查询与增量导出
+
+`history` / `export-history` 是独立只读模块（`src/pagewatch/history/`），不修改监测链路、摘要渲染或数据库 schema，仅读取现有 `events` 与 `watches` 表，并以 SQLite `query_only` 只读连接打开数据库。
+
+**过滤条件**
+
+| 参数 | 语义 |
+|---|---|
+| `--name`（重复） | 监视项并集 |
+| `--tag`（重复） | 标签并集（默认 `any`）；`--tag-match all` 要求同时具备全部标签 |
+| `--severity`（重复） | `noise`/`minor`/`major` 并集 |
+| `--since` / `--until` | 左闭右开 `[since, until)`，支持 ISO-8601 或 epoch 秒 |
+| `--config` | 可选 watchlist；提供后可按 `active/closed/deleted` 识别生命周期 |
+
+**游标语义（关键取舍）**：不使用 offset。页内排序固定为 `(created_at, watch_name, id)`，因此同一时间点发生多级、多监视项变更时顺序确定；`id` 为 `AUTOINCREMENT` 单调不复用，同时充当快照水位。
+
+- 每一轮开始时固定水位 `watermark = MAX(events.id)`，本轮只读 `id <= watermark` 且严格排在上一页末条之后的记录。并发写入的新事件 id 更大，**不会挤动已翻过的页**。
+- 游标解码后携带 `after`（跨轮的下界）、`watermark` + `position`（轮内 keyset），以及校验和；携带 SHA-256 校验和，篡改/截断会以明确错误返回。
+- 一轮翻空后返回终态游标（仅保留 `after=watermark`）；从该游标再拉会开启新一轮，只取新写入事件，**既不重复也不遗漏**。
+- 标签查询会在轮开始时冻结解析出的监视项名集合，轮内改名/改标签/关闭都不会让已读结果消失。
+- 游标绑定过滤指纹（名称/标签/severity/tag_match）。换过滤条件复用会报 `cursor_filter_mismatch`；时间窗之外复用报 `cursor_out_of_range`；损坏/篡改报 `cursor_malformed`；`since >= until` 在构造查询时即报 `invalid_range`。每种错误码对应独立进程退出码（2/3/4/5/6），不会静默返回空。
+
+**JSONL 稳定键**：每行包含 `watch_name` 与 `event_seq`（即事件 `id`），并冗余 `key` 对象。下游按 `(watch_name, event_seq)` upsert 即可幂等。`--append` 对已有文件按该键去重；空页（`cursor_only`）只推进并落盘游标，不截断既有台账。
+
+**降级返回**：`--tag` 命中的已关闭（watchlist 中 `enabled: false`）或已删除（有历史但不在 watchlist）监视项仍返回全部历史事件，并在 `degraded_watches` 与 stderr 中标注 `state/source`；显式 `--name` 指定未知监视项时按 `unknown` 降级，不报错。
 
 ## 数据布局与运行时机制
 
@@ -214,11 +262,26 @@ outbox 每行示例（虚构）：
 
 ## 测试与验收
 
-- `pytest -q`：64 个测试，全绿；不依赖网络和真实时间。
+- `pytest -q`：不依赖网络和真实时间；新增 `tests/test_history.py` 与 `tests/test_history_cli.py` 覆盖游标编解码、同刻多级排序、左闭右开、并集过滤、生命周期降级、并发写入、错误分类、两轮导出与 CLI 退出码。
 - `tests/conftest.py` 中的 socket 守卫 monkeypatch `connect` / `connect_ex`，会话结束断言无任何非本机连接尝试。
 - 时钟通过 `FrozenClock` 注入；数据目录均使用 `tmp_path` 隔离。
-- 核心模块（normalize / diff / classify / retention）单文件行覆盖率均 ≥85%；全项目约 85%。
+- 核心模块（normalize / diff / classify / retention / history）单文件行覆盖率均 ≥85%；全项目约 86%。
 - 示例：`python -m pagewatch.demo` 在断网环境产出 `data/out/digest.html`；`compact --dry-run` 与正式执行使用同一计划函数。
+
+### 离线可复现验收场景
+
+```bash
+pagewatch history-acceptance --output-dir data/acceptance
+```
+
+该命令完全离线：启动本机模拟站点、以冻结时钟跑完 step0→step4、写入若干脚本化历史事件（同一时刻三个监视项的不同级别、一个关闭项、一个已删除项），然后：
+
+1. 连续导出两轮 JSONL，两轮之间写入新事件；断言两轮并集覆盖数据库全部事件且**无重复、无遗漏**，第二轮只包含区间内新事件；
+2. 从第一轮终态游标再拉一次，断言为空且不重放；
+3. 取旧游标后写入新事件，断言旧游标仍能正常推进且**看不到**并发事件，轮结束后再拉恰好看到一次；
+4. 校验 `cursor_malformed` / `cursor_filter_mismatch` / `cursor_out_of_range` / `invalid_range` 四类错误可区分。
+
+验收报告写入 `<output-dir>/history-acceptance.json`，两轮台账写入 `ledger-round1.jsonl` / `ledger-round2.jsonl`。加上 `--with-writer-stress` 还会在后台线程持续写入的同时反复拉取，验证导出不丢不重（该附加检查依赖时序，故默认关闭以保证确定性）。同一输出目录重复运行结果逐字节一致。
 
 ## 已知限制与明确不实现
 
