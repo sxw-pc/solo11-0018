@@ -71,6 +71,33 @@ def _parser() -> argparse.ArgumentParser:
     compact_cmd.add_argument("--dry-run", action="store_true")
     compact_cmd.set_defaults(func=_cmd_compact)
 
+    replay_cmd = sub.add_parser(
+        "replay", help="rebuild a traceable per-watch replay of monitoring rounds")
+    replay_cmd.add_argument("--data-dir", default="data")
+    replay_cmd.add_argument("--round", dest="rounds", action="append",
+                            default=[], metavar="N_OR_TIME",
+                            help="select a round by 1-based index or ISO/epoch "
+                                 "timestamp; repeatable (default: all rounds)")
+    replay_cmd.add_argument("--last", type=int, default=None, metavar="N",
+                            help="select the last N rounds")
+    replay_cmd.add_argument("--watch", action="append", default=[],
+                            help="restrict the report to these watch names")
+    replay_cmd.add_argument("--round-gap-seconds", type=float, default=None,
+                            help="max gap between probe timestamps of one "
+                                 "round (default: 2.0)")
+    replay_cmd.add_argument("--output", default=None,
+                            help="HTML output path (default: <data-dir>/out/replay.html)")
+    replay_cmd.add_argument("--json-out", default=None,
+                            help="JSON output path (default: <data-dir>/out/replay.json)")
+    replay_cmd.add_argument("--generated-at", default=None,
+                            help="pin the header timestamp (ISO-8601); defaults "
+                                 "to the end of the latest selected round")
+    replay_cmd.add_argument("--temp-dir", default=None,
+                            help="base directory for archive extraction "
+                                 "(default: system temp)")
+    replay_cmd.add_argument("--title", default="pagewatch replay report")
+    replay_cmd.set_defaults(func=_cmd_replay)
+
     status = sub.add_parser("serve-status", help="serve read-only status on localhost")
     status.add_argument("--data-dir", default="data")
     status.add_argument("--host", default="127.0.0.1")
@@ -140,6 +167,45 @@ def _cmd_digest(args: argparse.Namespace) -> int:
     print(f"digest: {result.html_path} ({result.event_count} event(s))")
     if result.json_path:
         print(f"events: {result.json_path}")
+    return 0
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    from contextlib import closing
+
+    from .replay.chain import build_replay, connect_readonly
+    from .replay.report import write_report
+    from .replay.rounds import (
+        DEFAULT_ROUND_GAP_SECONDS, discover_rounds, select_rounds,
+    )
+    from .replay.workspace import ReplayWorkspace
+
+    paths = DataPaths(Path(args.data_dir))
+    if not paths.db_path.exists():
+        raise FileNotFoundError(f"database not found: {paths.db_path}")
+    gap = (args.round_gap_seconds if args.round_gap_seconds is not None
+           else DEFAULT_ROUND_GAP_SECONDS)
+    with closing(connect_readonly(paths.db_path)) as connection:
+        discovered = discover_rounds(connection, gap_seconds=gap)
+    selected = select_rounds(discovered, selectors=args.rounds, last=args.last)
+    with ReplayWorkspace(args.temp_dir) as workspace:
+        report = build_replay(
+            paths.db_path, paths.archive_dir, rounds=selected,
+            watch_names=args.watch, workspace=workspace,
+            generated_at=args.generated_at)
+    output = Path(args.output) if args.output else paths.out_dir / "replay.html"
+    json_out = (Path(args.json_out) if args.json_out
+                else paths.out_dir / "replay.json")
+    result = write_report(report, output, json_out, title=args.title)
+    chains = [chain for rnd in report.rounds for chain in rnd.chains]
+    counts = {"ok": 0, "degraded": 0, "broken": 0}
+    for chain in chains:
+        counts[chain.status] += 1
+    print(f"replay: {len(report.rounds)} round(s), {len(chains)} chain(s) — "
+          f"{counts['ok']} ok, {counts['degraded']} degraded, "
+          f"{counts['broken']} broken")
+    print(f"html: {result.html_path}")
+    print(f"json: {result.json_path}")
     return 0
 
 

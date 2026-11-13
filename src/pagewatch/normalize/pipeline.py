@@ -16,6 +16,11 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def block_hash(text: str) -> str:
+    """Hash one normalized block's text; archived with each block."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def blocks_to_json(blocks: Sequence[NormalizedBlock]) -> str:
     return json.dumps([block.as_dict() for block in blocks],
                       ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -60,6 +65,7 @@ def normalize_html(
             region=str(raw["region"]),
             is_focus=bool(raw["is_focus"]),
             is_noise=bool(raw["is_noise"]),
+            hash=block_hash(text),
         ))
     full_text = "\n".join(block.text for block in normalized)
     return NormalizedPage(

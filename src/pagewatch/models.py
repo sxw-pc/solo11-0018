@@ -70,6 +70,9 @@ class NormalizedBlock:
     region: str
     is_focus: bool = False
     is_noise: bool = False
+    # sha256 of the normalized block text; empty for legacy archives that
+    # predate per-block hashing.
+    hash: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,6 +86,7 @@ class NormalizedBlock:
             region=str(value["region"]),
             is_focus=bool(value.get("is_focus", False)),
             is_noise=bool(value.get("is_noise", False)),
+            hash=str(value.get("hash", "")),
         )
 
 

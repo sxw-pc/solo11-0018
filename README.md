@@ -75,6 +75,7 @@ src/pagewatch/           cli / config / models / runner / clock
   alert/                 告警资格规则、JSONL outbox
   schedule/              错峰、退避、并发上限
   report/                digest 渲染与只读状态页
+  replay/                按轮次重建可溯源链路的回放报告
   retention/             保留策略与 compact
 mocksite/                确定性 Flask 模拟站点与剧本
 tests/                   单元、集成、离线守卫与 fixtures
@@ -151,6 +152,12 @@ pagewatch digest --data-dir data --output data/out/digest.html \
                  --json-out data/out/events.json \
                  --since 2026-01-01T00:00:00Z --until 2026-01-02T00:00:00Z
 
+# 回放：按监视项重建一轮或多轮监测的有序链路（JSON + 静态 HTML）
+pagewatch replay --data-dir data --last 3
+pagewatch replay --data-dir data --round 2 --round 2026-01-01T00:03:00Z \
+                 --watch docs --output data/out/replay.html \
+                 --json-out data/out/replay.json
+
 # 清理：dry-run 只打印对象与释放空间；执行后更新统计台账，可重复执行
 pagewatch compact --data-dir data --dry-run
 pagewatch compact --data-dir data
@@ -163,6 +170,24 @@ pagewatch demo
 ```
 
 `digest` 的 HTML/JSON 排序固定、无 JavaScript、无外部资源；`--generated-at` 可显式固定页眉时间，因此相同数据和参数生成逐字节一致的文件。
+
+## 回放报告（replay）
+
+`replay` 回答「这一轮到底发生了什么」：它把同一轮里分散在 probes、留档、快照、事件、告警台账中的记录，按监视项重建成一条与监测实际执行顺序一致的有序链路：
+
+```
+probe → archive → snapshot → normalize → diff → classify → alert
+探测记录   原始留档     快照版本      规范化块哈希    差异指标   分级结果   告警发放
+```
+
+- **轮次发现**：轮次由 probes 台账的 `checked_at` 聚类重建（同一次 `run-once` 的各监视项时间戳相同或相近，间隙容差由 `--round-gap-seconds` 控制，默认 2 秒）。`--round` 按 1 起始序号或 ISO/epoch 时间戳选轮，`--last N` 选最近 N 轮，默认全部。
+- **链路状态**：每个环节标记 `ok` / `skipped`（合理缺席，如 304、内容未变、冷却期未告警）/ `degraded`（降级推断）/ `missing` 与 `invalid`（**断点**）。缺失或矛盾的环节（留档文件被删、哈希不匹配、事件引用的快照不存在）标为断点并说明断在哪一步，不跳过、不中断整份报告。
+- **旧数据兼容**：早期快照的块记录没有 `hash` 字段时，normalize 环节降级为按块文本推断哈希（`source: inferred`），并在 JSON/HTML 中显式标注降级原因；`blocks_json` 损坏则标为断点，均不报错退出。
+- **纯只读**：以 `mode=ro&immutable=1` 打开数据库并加 `PRAGMA query_only=ON`，不写任何运行台账、不在数据目录产生 `-shm`/`-wal` 副作用文件。若数据库存在未 checkpoint 的 WAL 数据（可能有监测正在进行），回放拒绝读取并提示稍后重试，而不是读到旧状态。
+- **可复现**：报告不含墙钟；页眉时间取所选轮次的最晚时间（可用 `--generated-at` 固定）。同一轮记录回放两次，JSON 与 HTML 均逐字节一致。
+- **临时解压**：校验留档时把 gzip 解压到本次回放私有的临时目录（`tempfile.mkdtemp`，可用 `--temp-dir` 指定父目录），并发回放互不可见；正常结束、异常或收到 SIGINT/SIGTERM 时都会清理，不留残余。
+
+退出码：报告生成即 `0`（断点是数据结论而非回放失败）；数据库缺失、轮次选择无效等为 `2`。
 
 ## 数据布局与运行时机制
 
@@ -214,7 +239,7 @@ outbox 每行示例（虚构）：
 
 ## 测试与验收
 
-- `pytest -q`：64 个测试，全绿；不依赖网络和真实时间。
+- `pytest -q`：83 个测试，全绿；不依赖网络和真实时间。
 - `tests/conftest.py` 中的 socket 守卫 monkeypatch `connect` / `connect_ex`，会话结束断言无任何非本机连接尝试。
 - 时钟通过 `FrozenClock` 注入；数据目录均使用 `tmp_path` 隔离。
 - 核心模块（normalize / diff / classify / retention）单文件行覆盖率均 ≥85%；全项目约 85%。
