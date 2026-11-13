@@ -182,7 +182,8 @@ def _clean_overrides(values: dict[str, Any], path: Path, location: str) -> dict[
         elif key == "max_bytes":
             cleaned[key] = _int(value, path, location, key, 1024)
         elif key in {"noise_max_change_rate", "major_change_rate"}:
-            cleaned[key] = _number(value, path, location, key, 0.0, 1.0)
+            minimum = 0.01 if key == "major_change_rate" else 0.0
+            cleaned[key] = _number(value, path, location, key, minimum, 1.0)
         elif key in RULE_FIELDS:
             minimum = 0 if key in {"alert_cooldown_seconds", "jitter_seconds",
                                    "archive_max_age_days"} else 1
@@ -287,11 +288,23 @@ def load_rules(path: str | Path) -> Rules:
 
 
 def effective_rules(base: Rules, watch: WatchSpec) -> Rules:
-    """Merge a watch's validated overrides onto the global rule set."""
+    """Merge a watch's validated overrides onto the global rule set.
+
+    Precedence is fixed and predictable: every flat field in
+    ``rule_overrides`` wins over the global default, and every uncovered
+    field is inherited unchanged from ``base``. The merged result is then
+    validated as a whole so an override cannot produce an inconsistent
+    rule set (e.g. a noise floor above the major threshold).
+    """
     if not watch.rules_overrides:
         return base
     values = dict(watch.rules_overrides)
-    return replace(base, **values)
+    merged = replace(base, **values)
+    if merged.noise_max_change_rate > merged.major_change_rate:
+        raise ConfigError(
+            "noise_max_change_rate must not exceed major_change_rate "
+            f"after applying rule_overrides for watch {watch.name!r}")
+    return merged
 
 
 def load_all(watchlist_path: str | Path, rules_path: str | Path) -> tuple[list[WatchSpec], Rules]:

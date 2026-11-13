@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ..models import Rules
 from ..storage.db import connect, get_stat, set_stat, transaction
-from ..storage.events import add_audit
+from ..storage.events import add_audit, event_referenced_snapshot_ids
 from ..storage.snapshots import all_snapshots, delete_snapshots, major_snapshot_ids
 from .policy import RetentionPlan, build_plan
 
@@ -27,11 +27,13 @@ def plan_from_database(db_path: str | Path, archive_dir: str | Path,
     with connect(db_path) as connection:
         snapshots = all_snapshots(connection)
         majors = major_snapshot_ids(connection)
+        referenced = event_referenced_snapshot_ids(connection)
     return build_plan(
         snapshots, majors, keep_last=rules.keep_last,
         major_keep_forever=rules.major_keep_forever,
         archive_dir=archive_dir, now=now,
         archive_max_age_days=rules.archive_max_age_days,
+        referenced_ids=referenced,
     )
 
 

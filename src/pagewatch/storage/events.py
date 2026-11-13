@@ -122,6 +122,20 @@ def insert_alert(connection: sqlite3.Connection, *, watch_name: str,
     return _alert(row) if row else None
 
 
+def event_referenced_snapshot_ids(connection: sqlite3.Connection) -> set[int]:
+    """All snapshot ids referenced as either endpoint of a change event.
+
+    Both endpoints back the digest's ``from -> to`` comparison links, so
+    retention must keep every one of them regardless of keep_last windows.
+    """
+    rows = connection.execute(
+        "SELECT from_snapshot_id AS snapshot_id FROM events "
+        "UNION "
+        "SELECT to_snapshot_id AS snapshot_id FROM events"
+    ).fetchall()
+    return {int(row["snapshot_id"]) for row in rows}
+
+
 def list_alerts(connection: sqlite3.Connection) -> list[AlertRecord]:
     rows = connection.execute("SELECT * FROM alerts ORDER BY id").fetchall()
     return [_alert(row) for row in rows]

@@ -104,7 +104,8 @@ def _cmd_run_once(args: argparse.Namespace) -> int:
                               due_only=args.due_only, states=states, now=now)
     runner = Runner(db_path=paths.db_path, archive_dir=paths.archive_dir,
                     outbox_path=paths.outbox_path, rules=rules, clock=clock)
-    results = execute_round(selected, runner.run, rules.max_workers)
+    results = execute_round(selected, runner.run, rules.max_workers,
+                            rules.jitter_seconds)
     payload = [asdict(result) for result in results]
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))

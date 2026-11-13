@@ -41,12 +41,20 @@ def snapshot_bytes(snapshot: Snapshot) -> int:
 
 def snapshots_to_prune(snapshots: Iterable[Snapshot], major_ids: set[int],
                        keep_last: int,
-                       major_keep_forever: bool = True) -> list[Snapshot]:
+                       major_keep_forever: bool = True,
+                       referenced_ids: set[int] | None = None) -> list[Snapshot]:
+    """Return snapshots that may be deleted.
+
+    A snapshot is protected when it is among the newest ``keep_last`` of its
+    watch, when it produced a major event (``major_keep_forever``), or when any
+    change event references it (digest comparison links need both endpoints).
+    """
+    referenced = referenced_ids or set()
     ordered = sorted(snapshots, key=lambda item: item.version, reverse=True)
     protected = {snapshot.id for snapshot in ordered[:max(0, keep_last)]}
     candidates: list[Snapshot] = []
     for snapshot in ordered:
-        if snapshot.id in protected:
+        if snapshot.id in protected or snapshot.id in referenced:
             continue
         if major_keep_forever and (snapshot.id in major_ids or snapshot.is_major):
             continue
@@ -81,16 +89,25 @@ def archives_to_prune(archive_dir: str | Path, referenced_hashes: set[str],
 def build_plan(snapshots: Iterable[Snapshot], major_ids: set[int], *,
                keep_last: int, major_keep_forever: bool,
                archive_dir: str | Path, now: float,
-               archive_max_age_days: int) -> RetentionPlan:
-    """Compute both cleanup classes from an unchanged database snapshot."""
+               archive_max_age_days: int,
+               referenced_ids: set[int] | None = None) -> RetentionPlan:
+    """Compute both cleanup classes from an unchanged database snapshot.
+
+    ``referenced_ids`` is the full set of snapshot ids referenced by change
+    events (both endpoints). It is resolved before any pruning decision so
+    that event-backed snapshots -- and the gzip archives they reference --
+    survive compaction even when they fall outside the keep_last window.
+    """
     all_snapshots = list(snapshots)
+    event_referenced = set(referenced_ids or ())
     grouped: dict[str, list[Snapshot]] = {}
     for snapshot in all_snapshots:
         grouped.setdefault(snapshot.watch_name, []).append(snapshot)
     pruned: list[Snapshot] = []
     for group in grouped.values():
-        pruned.extend(snapshots_to_prune(group, major_ids, keep_last,
-                                         major_keep_forever))
+        pruned.extend(snapshots_to_prune(
+            group, major_ids, keep_last, major_keep_forever,
+            event_referenced))
     pruned_ids = {snapshot.id for snapshot in pruned}
     referenced = {snapshot.raw_sha256 for snapshot in all_snapshots
                   if snapshot.id not in pruned_ids and snapshot.raw_sha256}
